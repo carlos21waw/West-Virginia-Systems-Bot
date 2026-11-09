@@ -2,7 +2,7 @@ import { EmbedBuilder } from 'discord.js';
 import dotenv from 'dotenv';
 dotenv.config();
 
-const EMBED_COLOR = process.env.EMBED_COLOR || '#00A8FF';
+export const EMBED_COLOR = process.env.EMBED_COLOR || '#00A8FF';
 const BASE_HOST = process.env.PUBLIC_URL || 'https://wvrp-assets.local';
 
 /**
@@ -275,6 +275,27 @@ export const BANNER_MAPPINGS = {
     defaultTop: DEFAULT_LOCAL_BANNERS.DEPARTMENTS,
     defaultBottom: DEFAULT_LOCAL_BANNERS.BOTTOM
   },
+  department_application: {
+    specificTopEnv: 'DEPARTMENT_APPLICATION_BANNER_URL',
+    systemTopEnv: 'APPLICATION_TOP_BANNER_URL',
+    systemBottomEnv: 'APPLICATION_BOTTOM_BANNER_URL',
+    defaultTop: DEFAULT_LOCAL_BANNERS.APPLICATIONS,
+    defaultBottom: DEFAULT_LOCAL_BANNERS.BOTTOM
+  },
+  department_guidelines: {
+    specificTopEnv: 'DEPARTMENT_GUIDELINES_BANNER_URL',
+    systemTopEnv: 'DEPARTMENTS_TOP_BANNER_URL',
+    systemBottomEnv: 'DEPARTMENTS_BOTTOM_BANNER_URL',
+    defaultTop: DEFAULT_LOCAL_BANNERS.DEPARTMENTS,
+    defaultBottom: DEFAULT_LOCAL_BANNERS.BOTTOM
+  },
+  chain_of_command: {
+    specificTopEnv: 'CHAIN_OF_COMMAND_BANNER_URL',
+    systemTopEnv: 'DEPARTMENTS_TOP_BANNER_URL',
+    systemBottomEnv: 'DEPARTMENTS_BOTTOM_BANNER_URL',
+    defaultTop: DEFAULT_LOCAL_BANNERS.DEPARTMENTS,
+    defaultBottom: DEFAULT_LOCAL_BANNERS.BOTTOM
+  },
 
   // SESSIONS
   session: {
@@ -538,8 +559,8 @@ export function resolveBanners(type = 'community', overrideTop = null, overrideB
       resolvedTop = safeUrl(process.env[mapping.specificTopEnv]);
     } else if (mapping.systemTopEnv && process.env[mapping.systemTopEnv] && process.env[mapping.systemTopEnv].trim().length > 0) {
       resolvedTop = safeUrl(process.env[mapping.systemTopEnv]);
-    } else if (process.env.TOP_BANNER_URL && process.env.TOP_BANNER_URL.trim().length > 0) {
-      resolvedTop = safeUrl(process.env.TOP_BANNER_URL);
+    } else if ((process.env.MAIN_BOT_BANNER_URL || process.env.TOP_BANNER_URL) && (process.env.MAIN_BOT_BANNER_URL || process.env.TOP_BANNER_URL).trim().length > 0) {
+      resolvedTop = safeUrl(process.env.MAIN_BOT_BANNER_URL || process.env.TOP_BANNER_URL);
     } else {
       resolvedTop = mapping.defaultTop || DEFAULT_LOCAL_BANNERS.TOP;
     }
@@ -552,8 +573,8 @@ export function resolveBanners(type = 'community', overrideTop = null, overrideB
     resolvedBottom = safeUrl(process.env[mapping.specificBottomEnv]);
   } else if (mapping.systemBottomEnv && process.env[mapping.systemBottomEnv] && process.env[mapping.systemBottomEnv].trim().length > 0) {
     resolvedBottom = safeUrl(process.env[mapping.systemBottomEnv]);
-  } else if (process.env.BOTTOM_BANNER_URL && process.env.BOTTOM_BANNER_URL.trim().length > 0) {
-    resolvedBottom = safeUrl(process.env.BOTTOM_BANNER_URL);
+  } else if ((process.env.UNIVERSAL_BOTTOM_BANNER_URL || process.env.BOTTOM_BANNER_URL) && (process.env.UNIVERSAL_BOTTOM_BANNER_URL || process.env.BOTTOM_BANNER_URL).trim().length > 0) {
+    resolvedBottom = safeUrl(process.env.UNIVERSAL_BOTTOM_BANNER_URL || process.env.BOTTOM_BANNER_URL);
   } else {
     resolvedBottom = mapping.defaultBottom || DEFAULT_LOCAL_BANNERS.BOTTOM;
   }
@@ -645,6 +666,81 @@ export class WvrpEmbedBuilder {
 
   static createDualBannerEmbeds(options) {
     return createWVRPEmbed(options);
+  }
+
+  static createSuccessEmbed({ title = 'Operation Successful', description, footerText = 'West Virginia Systems · Success', fields = [] }) {
+    const embed = WvrpEmbedBuilder.createBase({
+      color: 0x23a55a,
+      title: `✅ ${title.replace(/^[✅\s]+/, '')}`,
+      description,
+      footerText
+    });
+    if (fields && fields.length > 0) embed.addFields(fields);
+    embed.setImage(BANNERS.BOTTOM || 'https://wvrp-assets.local/banners/wvrp-banner-bottom.svg');
+    return embed;
+  }
+
+  static createErrorEmbed({ title = 'Error Encountered', description, footerText = 'West Virginia Systems · Error', fields = [] }) {
+    const embed = WvrpEmbedBuilder.createBase({
+      color: 0xf23f43,
+      title: `❌ ${title.replace(/^[❌\s]+/, '')}`,
+      description,
+      footerText
+    });
+    if (fields && fields.length > 0) embed.addFields(fields);
+    embed.setImage(BANNERS.BOTTOM || 'https://wvrp-assets.local/banners/wvrp-banner-bottom.svg');
+    return embed;
+  }
+
+  static createWarningEmbed({ title = 'Attention Required', description, footerText = 'West Virginia Systems · Warning', fields = [] }) {
+    const embed = WvrpEmbedBuilder.createBase({
+      color: 0xfee75c,
+      title: `⚠️ ${title.replace(/^[⚠️\s]+/, '')}`,
+      description,
+      footerText
+    });
+    if (fields && fields.length > 0) embed.addFields(fields);
+    embed.setImage(BANNERS.BOTTOM || 'https://wvrp-assets.local/banners/wvrp-banner-bottom.svg');
+    return embed;
+  }
+
+  static createInfoEmbed({ title, description, footerText = 'West Virginia Systems · Information', fields = [] }) {
+    const embed = WvrpEmbedBuilder.createBase({
+      color: 0x00a8ff,
+      title: `ℹ️ ${title ? title.replace(/^[ℹ️\s]+/, '') : 'Information'}`,
+      description,
+      footerText
+    });
+    if (fields && fields.length > 0) embed.addFields(fields);
+    embed.setImage(BANNERS.BOTTOM || 'https://wvrp-assets.local/banners/wvrp-banner-bottom.svg');
+    return embed;
+  }
+
+  static createDepartmentEmbed({ department, leader, roster = [] }) {
+    return createWVRPEmbed({
+      type: 'departments',
+      title: `⭐ ${department.name}`,
+      description: `${department.description}\n\n👑 **Department Leadership:** ${leader ? `<@${leader.id || leader}> (\`${department.leader_tag || 'Commander'}\`)` : 'Management Directive'}\n👥 **Active Personnel:** \`${roster.length} Officers/Members\`\n\n${roster.length > 0 ? roster.slice(0, 10).map(m => `• **${m.rank || 'Member'}** <@${m.user_id}> (\`${m.callsign || 'N/A'}\`)`).join('\n') : '*No personnel officially assigned to roster yet.*'}`,
+      footerText: 'West Virginia State Roleplay · Department Operations'
+    });
+  }
+
+  static createChainOfCommandEmbed({ departmentName = 'West Virginia State Roleplay', hierarchy = [] }) {
+    let desc = `### ${departmentName} · Chain of Command\nOfficial organizational hierarchy and leadership structure.\n\n`;
+    if (hierarchy.length === 0) {
+      desc += '*No chain of command records found for this division.*';
+    } else {
+      hierarchy.forEach(item => {
+        const star = item.is_leadership ? '⭐' : '🔹';
+        desc += `${star} **${item.rank_name}** — <@${item.user_id}> (\`${item.user_tag || 'Staff'}\`)\n> ↳ *Position:* **${item.position_title}**\n\n`;
+      });
+    }
+    return createWVRPEmbed({
+      type: 'chain_of_command',
+      title: `🏛️ ${departmentName} — Chain of Command`,
+      description: desc.trim(),
+      footerText: 'West Virginia State Roleplay · Chain of Command'
+    });
   }
 
   // Exact Infraction Layout: INF-0000

@@ -65,8 +65,8 @@ export async function loadCommands(baseDir = __dirname) {
       const mod = await import(fileUrl);
       const commandObj = mod.default || mod.command || mod;
 
-      if (!commandObj || typeof commandObj !== 'object') {
-        console.error(`[CommandLoader] Error loading ${filePath}: File does not export a valid command object.`);
+      if (!commandObj || typeof commandObj !== 'object' || !commandObj.name) {
+        // Skip helper modules without a command name
         continue;
       }
 

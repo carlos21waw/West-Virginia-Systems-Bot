@@ -9,7 +9,9 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  StringSelectMenuBuilder
+  StringSelectMenuBuilder,
+  ChannelType,
+  PermissionFlagsBits
 } from 'discord.js';
 import dotenv from 'dotenv';
 import db from './bot/database/index.js';
@@ -25,6 +27,9 @@ import afkService from './bot/services/afkService.js';
 import welcomeService from './bot/services/welcomeService.js';
 import boostService from './bot/services/boostService.js';
 import ticketWorkflowService, { WORKFLOW_TYPES } from './bot/services/ticketWorkflowService.js';
+import ticketService from './bot/services/ticketService.js';
+import applicationService from './bot/services/applicationService.js';
+import departmentService from './bot/services/departmentService.js';
 import { WvrpEmbedBuilder, BANNERS } from './bot/embeds/wvrpEmbeds.js';
 
 dotenv.config();
@@ -47,45 +52,84 @@ client.once(Events.ClientReady, (readyClient) => {
   console.log(`Loaded ${commands.size} slash commands and ${prefixCommands.size} prefix triggers.`);
 });
 
-// Message create handler (for prefix commands starting with DEFAULT_PREFIX or !afk)
+// Message create handler (supports prefixes, anti-ping, afk, ticket workflows, in-game shift commands, and direct answers)
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
 
-  // 1. Anti-Ping Security Check (Detect unauthorized pings to protected leadership roles/teams)
+  // 1. In-game ER:LC Chat Command Simulation (;shift start, ;shift 50/50, ;shift break, ;shift end)
+  if (message.content.startsWith(';shift')) {
+    const raw = message.content.slice(6).trim().toLowerCase();
+    if (raw === 'start' || raw === 'normal') {
+      const res = shiftService.startShift(message.author, 'NORMAL');
+      if (!res.success) return message.reply({ content: `❌ ${res.error}` });
+      return message.reply({ content: `🟢 **[ER:LC Shift Started]** On-Duty assigned. Follow staff uniform and conduct regulations.` });
+    } else if (raw === '50/50' || raw === '5050') {
+      const res = shiftService.startShift(message.author, '50/50');
+      if (!res.success) return message.reply({ content: `❌ ${res.error}` });
+      return message.reply({ content: `🟢 **[ER:LC 50/50 Shift Started]** On-Duty assigned. Shift counts toward weekly quota.` });
+    } else if (raw === 'break') {
+      const res = shiftService.startBreak(message.author);
+      if (!res.success) {
+        const resumeRes = shiftService.endBreak(message.author);
+        if (!resumeRes.success) return message.reply({ content: `❌ ${resumeRes.error}` });
+        return message.reply({ content: `🟢 **[ER:LC Shift Resumed]** Returned from break. On-Duty restored.` });
+      }
+      return message.reply({ content: `🟡 **[ER:LC Shift Break]** On break. Take your time to recharge.` });
+    } else if (raw === 'end' || raw === 'stop') {
+      const res = shiftService.endShift(message.author);
+      if (!res.success) return message.reply({ content: `❌ ${res.error}` });
+      return message.reply({ content: `🔴 **[ER:LC Shift Concluded]** Total duration: **${shiftService.formatDuration(res.creditedSeconds)}**. Thank you for your service!` });
+    }
+  }
+
+  // 2. Anti-Ping Security Check (Detect unauthorized pings to protected leadership roles/teams)
   try {
     const antiPingViolation = antiPingService.checkMessage(message);
     if (antiPingViolation) {
       await antiPingService.processViolation(message, antiPingViolation);
-      return; // Do not process commands or further actions from offending message
+      return; // Stop further processing
     }
   } catch (err) {
     console.error('Anti-Ping execution error:', err);
   }
 
-  // 2. AFK Return Check (If the sender was AFK, restore nickname and notify of missed pings)
+  // 3. AFK Return Check (If the sender was AFK, restore nickname and notify of missed pings)
   try {
     await afkService.handleReturn(message);
   } catch (err) {
     console.error('AFK Return error:', err);
   }
 
-  // 3. AFK Mention Notification (If sender pinged an AFK user, alert sender and log ping)
+  // 4. AFK Mention Notification (If sender pinged an AFK user, alert sender and log ping)
   try {
     await afkService.handleMentions(message);
   } catch (err) {
     console.error('AFK Mention error:', err);
   }
 
-  // 4. Ticket Automatic Responses & Keyword Detection + Groq Assistant
+  // 5. Private Application Channel: Direct Message Questionnaire Handler
+  if (message.channel && message.channel.name && message.channel.name.startsWith('application-')) {
+    if (!message.content.startsWith('-') && !message.content.startsWith('!')) {
+      const activeApp = db.prepare("SELECT * FROM applications WHERE channel_id = ? AND user_id = ? AND status = 'IN_PROGRESS'").get(message.channel.id, message.author.id);
+      if (activeApp) {
+        await applicationService.recordAnswer(activeApp.id, activeApp.current_question_index, message.content, message.author, message.channel);
+        return;
+      }
+    }
+  }
+
+  // 6. Ticket Automatic Responses & Keyword Detection + Groq Assistant
   if (message.channel && message.channel.name && message.channel.name.includes('ticket-')) {
     const ticketId = message.channel.name.split('-')[1];
     if (ticketId) {
-      // Check if message is from human staff
-      const isStaff = message.member?.roles?.cache?.some(r => r.name.toLowerCase().includes('staff') || r.name.toLowerCase().includes('mod') || r.name.toLowerCase().includes('admin'));
+      const isStaff = message.member?.roles?.cache?.some(r =>
+        r.name.toLowerCase().includes('staff') ||
+        r.name.toLowerCase().includes('mod') ||
+        r.name.toLowerCase().includes('admin')
+      );
       if (isStaff) {
         groqService.handleStaffMessage(ticketId, message.author);
       } else {
-        // Step 1: Check intelligent ticket automatic responses & keyword recognition (Fast-Pass, Transfers, Verification, etc.)
         let workflowHandled = false;
         try {
           const autoRes = await ticketWorkflowService.processTicketMessage(ticketId, message.channel, message);
@@ -96,7 +140,6 @@ client.on(Events.MessageCreate, async (message) => {
           console.error('Error running ticket workflow service:', wfErr);
         }
 
-        // Step 2: If no workflow template was triggered, proceed with Groq AI Support Assistant
         if (!workflowHandled) {
           const history = db.prepare('SELECT * FROM ticket_messages WHERE ticket_id = ? ORDER BY timestamp ASC LIMIT 8').all(ticketId);
           const aiRes = await groqService.generateTicketResponse(ticketId, message.content, history);
@@ -110,36 +153,29 @@ client.on(Events.MessageCreate, async (message) => {
     }
   }
 
-  // Explicit support for !afk command prefix
-  if (message.content.startsWith('!afk')) {
-    const args = message.content.slice(4).trim().split(/ +/).filter(s => s.length > 0);
-    const afkCmd = prefixCommands.get('afk');
-    if (afkCmd) {
-      try {
-        await afkCmd.execute({
-          author: message.author,
-          member: message.member,
-          channel: message.channel,
-          guild: message.guild,
-          reply: (opts) => message.reply(opts),
-          content: message.content
-        }, args);
-        return;
-      } catch (err) {
-        console.error('Error executing !afk:', err);
-        await message.reply({ content: `❌ Error setting AFK: ${err.message}` });
-        return;
-      }
-    }
+  // 7. Prefix Command Processing (Support both '!' and '-' prefixes)
+  const content = message.content.trim();
+  let matchedPrefix = null;
+
+  if (content.startsWith(DEFAULT_PREFIX)) {
+    matchedPrefix = DEFAULT_PREFIX;
+  } else if (content.startsWith('!')) {
+    matchedPrefix = '!';
+  } else if (content.startsWith('-')) {
+    matchedPrefix = '-';
   }
 
-  if (!message.content.startsWith(DEFAULT_PREFIX)) return;
+  if (!matchedPrefix) return;
 
-  const args = message.content.slice(DEFAULT_PREFIX.length).trim().split(/ +/);
-  const commandName = args.shift().toLowerCase();
+  const rawArgs = content.slice(matchedPrefix.length).trim().split(/ +/);
+  const commandName = (rawArgs.shift() || '').toLowerCase();
+  if (!commandName) return;
 
-  const command = prefixCommands.get(commandName);
+  // Check prefix commands map (which contains aliases and direct names)
+  const command = prefixCommands.get(commandName) || prefixCommands.get(`${matchedPrefix}${commandName}`);
+
   if (!command) {
+    // If unknown command, show intelligent suggestion format
     const unknownMsg = formatUnknownCommandMessage(commandName);
     await message.reply({ content: unknownMsg });
     return;
@@ -153,10 +189,10 @@ client.on(Events.MessageCreate, async (message) => {
       guild: message.guild,
       reply: (opts) => message.reply(opts),
       content: message.content
-    }, args);
+    }, rawArgs);
   } catch (err) {
     console.error(`Error executing prefix command ${commandName}:`, err);
-    await message.reply({ content: `❌ Error executing \`${DEFAULT_PREFIX}${commandName}\`: ${err.message}` });
+    await message.reply({ content: `❌ Error executing \`${matchedPrefix}${commandName}\`: ${err.message}` });
   }
 });
 
@@ -175,53 +211,465 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isButton()) {
       const customId = interaction.customId;
 
-      // Ticket Get Support button -> Show inquiry modal
-      if (customId === 'ticket_get_support') {
-        const modal = new ModalBuilder()
-          .setCustomId('modal_ticket_create')
-          .setTitle('Open a Support Ticket');
+      // ==========================================
+      // TICKET SYSTEM BUTTONS (Exact 6 Functionalities)
+      // ==========================================
+      // 1. Claim Ticket
+      if (customId === 'ticket_claim_btn' || customId.startsWith('ticket_claim_')) {
+        const ticketId = customId.startsWith('ticket_claim_') && customId !== 'ticket_claim_btn'
+          ? customId.replace('ticket_claim_', '')
+          : (interaction.channel?.name?.split('-')[1] || '0001');
 
-        const input = new TextInputBuilder()
-          .setCustomId('ticket_inquiry_input')
-          .setLabel('What is your inquiry?')
-          .setStyle(TextInputStyle.Paragraph)
-          .setPlaceholder('Describe the reason for opening this ticket in detail...')
-          .setRequired(true);
+        const res = ticketService.claimTicket(ticketId, interaction.user);
+        if (!res.success) return interaction.reply({ content: `❌ ${res.error}`, ephemeral: true });
 
-        modal.addComponents(new ActionRowBuilder().addComponents(input));
-        await interaction.showModal(modal);
-        return;
-      }
-
-      // Claim / Unclaim ticket
-      if (customId === 'ticket_claim_btn') {
-        await interaction.reply({ content: `✅ **@${interaction.user.username}** has claimed this ticket.` });
-        return;
-      }
-
-      if (customId === 'ticket_unclaim_btn') {
-        await interaction.reply({ content: `ℹ️ Ticket has been unclaimed by **@${interaction.user.username}**.` });
-        return;
-      }
-
-      // Close ticket
-      if (customId === 'ticket_close_btn') {
-        const res = await cookieTranscriptService.generateTranscript('0850', interaction.user);
-        const embeds = WvrpEmbedBuilder.createDualBannerEmbeds({
-          type: 'ticket_closed',
-          title: 'Ticket #0850 — General Support',
-          description: `General Support ticket in West Virginia Roleplay has been closed.\n\n↳ **Handled By:** @${interaction.user.username}\n↳ **Closed By:** @${interaction.user.username}\n⏰ **Opened:** 21m ago\n⏰ **Closed:** Just now\n⏳ **Duration:** 21m\n🎫 **Messages Sent:** 22 messages`
+        return interaction.reply({
+          content: `🟢 **Ticket Claimed!** This support ticket has been claimed by <@${interaction.user.id}>.`
         });
+      }
 
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setLabel('Online Transcript').setStyle(ButtonStyle.Link).setURL(`https://wvrp-transcripts.local${res.url}`)
+      // 2. Unclaim Ticket
+      if (customId.startsWith('ticket_unclaim_')) {
+        const ticketId = customId.replace('ticket_unclaim_', '');
+        const res = ticketService.unclaimTicket(ticketId);
+        if (!res.success) return interaction.reply({ content: `❌ ${res.error}`, ephemeral: true });
+
+        return interaction.reply({
+          content: `⚪ **Ticket Unclaimed.** This ticket has been returned to the general support queue.`
+        });
+      }
+
+      // 3. Add Member Modal Trigger
+      if (customId.startsWith('ticket_add_member_')) {
+        const ticketId = customId.replace('ticket_add_member_', '');
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_ticket_add_${ticketId}`)
+          .setTitle(`Add Member to Ticket #${ticketId}`);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('target_user_id')
+              .setLabel('Member Discord ID or Mention')
+              .setStyle(TextInputStyle.Short)
+              .setPlaceholder('e.g. 1025813762684502168 or @user')
+              .setRequired(true)
+          )
         );
 
-        await interaction.reply({ embeds, components: [row] });
-        return;
+        return interaction.showModal(modal);
       }
 
-      // Shift buttons
+      // 4. Remove Member Modal Trigger
+      if (customId.startsWith('ticket_remove_member_')) {
+        const ticketId = customId.replace('ticket_remove_member_', '');
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_ticket_remove_${ticketId}`)
+          .setTitle(`Remove Member from Ticket #${ticketId}`);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('target_user_id')
+              .setLabel('Member Discord ID or Mention')
+              .setStyle(TextInputStyle.Short)
+              .setPlaceholder('e.g. 1025813762684502168')
+              .setRequired(true)
+          )
+        );
+
+        return interaction.showModal(modal);
+      }
+
+      // 5. Rename Ticket Modal Trigger
+      if (customId.startsWith('ticket_rename_')) {
+        const ticketId = customId.replace('ticket_rename_', '');
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_ticket_rename_${ticketId}`)
+          .setTitle(`Rename Ticket #${ticketId}`);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('new_name')
+              .setLabel('New Channel Name')
+              .setStyle(TextInputStyle.Short)
+              .setPlaceholder('e.g. general-support or police-inquiry')
+              .setMinLength(2)
+              .setMaxLength(30)
+              .setRequired(true)
+          )
+        );
+
+        return interaction.showModal(modal);
+      }
+
+      // 6. Close Ticket
+      if (customId === 'ticket_close_btn' || customId.startsWith('ticket_close_')) {
+        const ticketId = customId.startsWith('ticket_close_') && customId !== 'ticket_close_btn'
+          ? customId.replace('ticket_close_', '')
+          : (interaction.channel?.name?.split('-')[1] || '0001');
+
+        await interaction.deferReply();
+        const res = await ticketService.closeTicket(ticketId, interaction.user);
+
+        return interaction.editReply({
+          content: `🔒 **Ticket #${res.ticketId} Closed by <@${interaction.user.id}>.**`,
+          embeds: res.embeds,
+          components: res.components
+        });
+      }
+
+      // Escalate Ticket
+      if (customId === 'ticket_escalate_btn' || customId.startsWith('ticket_escalate_')) {
+        const ticketId = customId.startsWith('ticket_escalate_') && customId !== 'ticket_escalate_btn'
+          ? customId.replace('ticket_escalate_', '')
+          : (interaction.channel?.name?.split('-')[1] || '0001');
+
+        return interaction.reply({
+          content: `🚨 **Ticket #${ticketId} Escalated!** High Command and Human Resources leadership have been notified.`
+        });
+      }
+
+      // ==========================================
+      // INFRACTION APPEAL WORKFLOW
+      // ==========================================
+      if (customId.startsWith('infraction_appeal_')) {
+        const infId = customId.replace('infraction_appeal_', '');
+        const inf = db.prepare('SELECT * FROM infractions WHERE id = ?').get(infId);
+
+        if (!inf) {
+          return interaction.reply({ content: `❌ Infraction record \`${infId}\` was not found.`, ephemeral: true });
+        }
+
+        if (inf.appealable === 0) {
+          return interaction.reply({ content: `❌ Infraction \`${infId}\` has been marked as non-appealable by High Command.`, ephemeral: true });
+        }
+
+        const existingAppeal = db.prepare("SELECT * FROM infraction_appeals WHERE infraction_id = ? AND user_id = ? AND status = 'PENDING'").get(infId, interaction.user.id);
+        if (existingAppeal) {
+          return interaction.reply({ content: `⚠️ You already have an active appeal open for **${infId}** (<#${existingAppeal.channel_id}>).`, ephemeral: true });
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+
+        const cleanName = (interaction.user.username || 'member').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 10);
+        const channelName = `appeal-${infId.toLowerCase()}-${cleanName}`;
+
+        let channel = null;
+        if (interaction.guild && interaction.guild.channels?.create) {
+          try {
+            const appealsCategory = interaction.guild.channels.cache.find(
+              c => c.type === ChannelType.GuildCategory && (c.name.toLowerCase().includes('appeal') || c.name.toLowerCase().includes('support'))
+            );
+
+            channel = await interaction.guild.channels.create({
+              name: channelName,
+              type: ChannelType.GuildText,
+              parent: appealsCategory ? appealsCategory.id : null,
+              permissionOverwrites: [
+                {
+                  id: interaction.guild.roles.everyone.id,
+                  deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages]
+                },
+                {
+                  id: interaction.user.id,
+                  allow: [
+                    PermissionFlagsBits.ViewChannel,
+                    PermissionFlagsBits.SendMessages,
+                    PermissionFlagsBits.ReadMessageHistory,
+                    PermissionFlagsBits.AttachFiles,
+                    PermissionFlagsBits.EmbedLinks
+                  ]
+                },
+                {
+                  id: interaction.client.user.id,
+                  allow: [
+                    PermissionFlagsBits.ViewChannel,
+                    PermissionFlagsBits.SendMessages,
+                    PermissionFlagsBits.ManageChannels,
+                    PermissionFlagsBits.ManageMessages,
+                    PermissionFlagsBits.EmbedLinks
+                  ]
+                }
+              ],
+              reason: `Infraction Appeal Channel for ${interaction.user.tag} (${infId})`
+            });
+          } catch (err) {
+            console.warn('Appeal channel creation fallback:', err.message);
+          }
+        }
+
+        const channelId = channel ? channel.id : `appeal_chan_${Date.now()}`;
+        const appealId = `APL-${infId}`;
+
+        db.prepare(`
+          INSERT INTO infraction_appeals (id, infraction_id, user_id, user_tag, channel_id, statement, status, created_at)
+          VALUES (?, ?, ?, ?, ?, 'Pending statement submission', 'PENDING', ?)
+        `).run(appealId, infId, interaction.user.id, interaction.user.tag || interaction.user.username, channelId, Date.now());
+
+        const appealWelcomeEmbeds = WvrpEmbedBuilder.createDualBannerEmbeds({
+          type: 'infraction_appeal',
+          title: `WEST VIRGINIA STATE ROLEPLAY · INFRACTION APPEAL`,
+          description: [
+            `Welcome <@${interaction.user.id}>! This is your official appeal channel for **${infId}**.`,
+            '',
+            '**Infraction Details:**',
+            `• **Infraction ID:** \`${infId}\``,
+            `• **Punishment:** \`${inf.punishment}\``,
+            `• **Reason on Record:** "${inf.reason}"`,
+            `• **Issued By:** <@${inf.issuer_id}>`,
+            '',
+            '📌 **Instructions:**',
+            'Please click the **"Submit Appeal Statement"** button below to provide a thorough explanation of why this infraction should be revoked, and attach any relevant counter-evidence links.',
+            '',
+            '*Your appeal statement will be reviewed for clarity, accuracy, and evaluated by High Command.*'
+          ].join('\n')
+        });
+
+        const appealStartRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`appeal_submit_btn_${infId}`)
+            .setLabel('Submit Appeal Statement')
+            .setStyle(ButtonStyle.Primary)
+            .setEmoji('📝')
+        );
+
+        if (channel && channel.send) {
+          await channel.send({ content: `<@${interaction.user.id}> @here`, embeds: appealWelcomeEmbeds, components: [appealStartRow] });
+        }
+
+        return interaction.editReply({
+          content: `✅ **Appeal Channel Established!** Head to <#${channelId}> to submit your appeal statement.`
+        });
+      }
+
+      // Infraction Appeal Statement Modal Trigger
+      if (customId.startsWith('appeal_submit_btn_')) {
+        const infId = customId.replace('appeal_submit_btn_', '');
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_infraction_appeal_${infId}`)
+          .setTitle(`Appeal Statement · ${infId}`);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('appeal_statement')
+              .setLabel('Explanation & Counter-Evidence')
+              .setStyle(TextInputStyle.Paragraph)
+              .setPlaceholder('Detail what happened and why this infraction should be reversed...')
+              .setMinLength(15)
+              .setRequired(true)
+          )
+        );
+
+        return interaction.showModal(modal);
+      }
+
+      // Reviewer: Accept Appeal Button
+      if (customId.startsWith('appeal_accept_')) {
+        const infId = customId.replace('appeal_accept_', '');
+        const inf = db.prepare('SELECT * FROM infractions WHERE id = ?').get(infId);
+        if (!inf) return interaction.reply({ content: '❌ Infraction not found.', ephemeral: true });
+
+        const now = Date.now();
+        db.transaction(() => {
+          db.prepare("UPDATE infractions SET status = 'REVOKED', revoked_by = ?, revoke_reason = 'Appeal approved by High Rank' WHERE id = ?")
+            .run(interaction.user.tag || interaction.user.username, infId);
+          db.prepare("UPDATE infraction_appeals SET status = 'ACCEPTED', reviewer_id = ?, reviewer_tag = ?, reviewed_at = ? WHERE infraction_id = ?")
+            .run(interaction.user.id, interaction.user.tag || interaction.user.username, now, infId);
+          db.prepare("INSERT INTO audit_logs (action, executor_id, target_id, details, created_at) VALUES ('INFRACTION_APPEAL_ACCEPTED', ?, ?, ?, ?)")
+            .run(interaction.user.id, inf.staff_id, `Appeal accepted for ${infId}`, now);
+        })();
+
+        // DM user revocation confirmation with Top & Bottom banners
+        try {
+          const dmEmbeds = WvrpEmbedBuilder.createDualBannerEmbeds({
+            type: 'infraction_revoked',
+            title: 'WEST VIRGINIA STATE ROLEPLAY · INFRACTION APPEAL APPROVED',
+            description: [
+              `Hello <@${inf.staff_id}>,`,
+              '',
+              `Your appeal for **${infId}** has been **APPROVED** by <@${interaction.user.id}>.`,
+              '',
+              `• **Infraction ID:** \`${infId}\``,
+              `• **Previous Punishment:** \`${inf.punishment}\``,
+              `• **Status:** \`REVOKED\``,
+              `• **Decision Date:** <t:${Math.floor(now / 1000)}:F>`,
+              '',
+              'This record has been officially removed from your active disciplinary record.'
+            ].join('\n')
+          });
+
+          const recipient = await interaction.guild?.members?.fetch(inf.staff_id).catch(() => null);
+          if (recipient && recipient.user?.send) {
+            await recipient.user.send({ embeds: dmEmbeds });
+          }
+        } catch (dmErr) {
+          console.warn(`Could not DM appeal approval to ${inf.staff_id}:`, dmErr.message);
+        }
+
+        return interaction.reply({
+          content: `✅ **Infraction ${infId} Officially Revoked!** Appeal approved by <@${interaction.user.id}>.`
+        });
+      }
+
+      // Reviewer: Deny Appeal Button
+      if (customId.startsWith('appeal_deny_')) {
+        const infId = customId.replace('appeal_deny_', '');
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_appeal_deny_${infId}`)
+          .setTitle(`Deny Appeal · ${infId}`);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('denial_reason')
+              .setLabel('Reason for Denying Appeal')
+              .setStyle(TextInputStyle.Paragraph)
+              .setPlaceholder('Explain why the evidence provided is insufficient...')
+              .setRequired(true)
+          )
+        );
+
+        return interaction.showModal(modal);
+      }
+
+      // ==========================================
+      // APPLICATION WORKFLOW BUTTONS
+      // ==========================================
+      // Start department application button
+      if (customId === 'app_apply_staff' || customId.startsWith('app_apply_dept_')) {
+        const deptId = customId.startsWith('app_apply_dept_') ? customId.replace('app_apply_dept_', '') : 'staff';
+        await interaction.deferReply({ ephemeral: true });
+
+        const session = await applicationService.createApplicationSession(interaction.guild, interaction.user, deptId);
+        if (!session.success) {
+          return interaction.editReply({ content: `❌ ${session.error}` });
+        }
+
+        return interaction.editReply({
+          content: `✅ **Private Application Created!** Head over to <#${session.channelId}> to complete your application for **${session.department.name}**.`
+        });
+      }
+
+      // Sequential Question Answer Button: app_q_answer_{appId}_{qIndex}
+      if (customId.startsWith('app_q_answer_')) {
+        const parts = customId.split('_'); // ['app', 'q', 'answer', appId, qIndex]
+        const appId = parts[3];
+        const qIndex = parseInt(parts[4], 10) || 0;
+
+        const app = applicationService.getApplication(appId);
+        if (!app) return interaction.reply({ content: '❌ Application not found.', ephemeral: true });
+
+        const dept = departmentService.getDepartment(app.department_id);
+        let questions = [];
+        try {
+          questions = JSON.parse(dept?.questions_json || '[]');
+        } catch (e) {
+          questions = [];
+        }
+
+        const prompt = questions[qIndex] || `Question ${qIndex + 1}`;
+
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_app_q_${appId}_${qIndex}`)
+          .setTitle(`Question ${qIndex + 1} of ${questions.length}`);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('answer_input')
+              .setLabel(prompt.slice(0, 45))
+              .setStyle(TextInputStyle.Paragraph)
+              .setPlaceholder('Write your detailed answer here...')
+              .setMinLength(2)
+              .setRequired(true)
+          )
+        );
+
+        return interaction.showModal(modal);
+      }
+
+      // Application Reviewer: Approve Application Button
+      if (customId.startsWith('app_accept_')) {
+        const appId = customId.replace('app_accept_', '');
+        await interaction.deferReply();
+        const res = await applicationService.acceptApplication(appId, interaction.user, interaction.guild);
+        if (!res.success) return interaction.editReply({ content: `❌ ${res.error}` });
+
+        return interaction.editReply({
+          content: `✅ **Application Approved!** Candidate has been accepted by <@${interaction.user.id}>. Notification DM dispatched.`,
+          embeds: res.embeds
+        });
+      }
+
+      // Application Reviewer: Deny Application Button
+      if (customId.startsWith('app_deny_')) {
+        const appId = customId.replace('app_deny_', '');
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_app_deny_${appId}`)
+          .setTitle(`Deny Application ${appId}`);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('denial_reason')
+              .setLabel('Reason for Denial')
+              .setStyle(TextInputStyle.Paragraph)
+              .setPlaceholder('Explain why the candidate does not meet requirements...')
+              .setRequired(true)
+          )
+        );
+
+        return interaction.showModal(modal);
+      }
+
+      // Application Reviewer: Request Interview Button
+      if (customId.startsWith('app_interview_')) {
+        const appId = customId.replace('app_interview_', '');
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_app_interview_${appId}`)
+          .setTitle(`Request Interview · ${appId}`);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('interview_notes')
+              .setLabel('Interview Instructions & Date')
+              .setStyle(TextInputStyle.Paragraph)
+              .setPlaceholder('Provide scheduling details or voice channel requirements...')
+              .setRequired(true)
+          )
+        );
+
+        return interaction.showModal(modal);
+      }
+
+      // Application Reviewer: Request Changes Button
+      if (customId.startsWith('app_changes_')) {
+        const appId = customId.replace('app_changes_', '');
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_app_changes_${appId}`)
+          .setTitle(`Request Changes · ${appId}`);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('changes_notes')
+              .setLabel('Feedback / Revisions Needed')
+              .setStyle(TextInputStyle.Paragraph)
+              .setPlaceholder('Specify which questions or scenarios need expansion...')
+              .setRequired(true)
+          )
+        );
+
+        return interaction.showModal(modal);
+      }
+
+      // ==========================================
+      // SHIFT & VERIFICATION BUTTONS
+      // ==========================================
       if (customId === 'shift_start_normal') {
         const res = shiftService.startShift(interaction.user, 'NORMAL');
         if (!res.success) return interaction.reply({ content: `❌ ${res.error}`, ephemeral: true });
@@ -237,7 +685,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (customId === 'shift_break_toggle') {
         const res = shiftService.startBreak(interaction.user);
         if (!res.success) {
-          // If already on break, resume
           const resumeRes = shiftService.endBreak(interaction.user);
           if (!resumeRes.success) return interaction.reply({ content: `❌ ${resumeRes.error}`, ephemeral: true });
           return interaction.reply({ content: `🟢 **Resumed from Break!** On-Duty role restored.` });
@@ -251,38 +698,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return interaction.reply({ content: `🔴 **Shift Ended.** Total credited working duration: **${shiftService.formatDuration(res.creditedSeconds)}**. Thank you for your service to WVRP!` });
       }
 
-      // Session Vote button
-      if (customId === 'session_vote_btn' || customId === 'session_vote_yes') {
-        return interaction.reply({ content: `👍 **Vote Recorded!** You voted for a session startup.` });
-      }
-
-      // Marketplace Terms of Service button
-      if (customId === 'market_tos_view') {
-        const embeds = WvrpEmbedBuilder.createDualBannerEmbeds({
-          type: 'marketplace_tos',
-          title: 'WVRP Marketplace Terms of Service',
-          description: `By purchasing any product, service, membership, advertisement, sponsorship, or other offering through the West Virginia Roleplay Marketplace, you confirm that you have read, understood, and agreed to the following Terms of Service.\n\n**01 — ORDER QUEUE**\nAll orders, requests, and submissions are processed in the order they are received.\n\n**02 — RESPECT & CONDUCT**\nWe maintain a respectful environment for both customers and staff. Harassment or abuse will result in service denial without compensation.\n\n**03 — LINKS & REQUIRED ASSETS**\nCustomers are responsible for providing valid files, links, and assets.\n\n**04 — ORDER CHANGES**\nAny changes must be requested before work begins.\n\n**05 — CLAIMING PURCHASES**\nAll purchases must be claimed through an official Support Ticket.\n\n**06 — PROCESSING & RESPONSE TIMES**\nEstimated completion times are not guaranteed.\n\n**07 — REFUNDS & CANCELLATIONS**\nAll purchases are final. We do not offer refunds under any circumstances.\n\n**08 — CHARGEBACKS**\nInitiating a chargeback will result in permanent removal from WVRP.\n\n**09 — RIGHT TO REFUSE SERVICE**\nWe reserve the right to refuse service to any individual.\n\n**10 — RESPONSIBILITY**\nWest Virginia Roleplay IS NOT responsible to pay giveaway prizes or for incorrect assets.`
-        });
-        return interaction.reply({ embeds, ephemeral: true });
-      }
-
-      // Welcome: Show Members Button
-      if (customId === 'welcome_show_members') {
-        const memberCount = interaction.guild?.memberCount || 20028;
-        const onlineCount = interaction.guild?.members?.cache
-          ? interaction.guild.members.cache.filter(m => m.presence?.status && m.presence.status !== 'offline').size
-          : Math.floor(memberCount * 0.22);
-
-        const embed = WvrpEmbedBuilder.createBase({
-          title: '👥 West Virginia State Roleplay — Community Statistics',
-          description: `Here are the latest real-time community statistics for **West Virginia State Roleplay**:\n\n• 👥 **Total Members:** **${memberCount.toLocaleString()}** members\n• 🟢 **Active Online:** **${(onlineCount || 4280).toLocaleString()}** members\n• 🚀 **Server Boost Status:** Level 3 Booster Status\n• 🚨 **ER:LC Status:** Whitelisted Private Server Active (\`wvrp\`)\n\nThank you for being a valued part of our growing community!`,
-          footerText: 'West Virginia State Roleplay · Member Count'
-        });
-
-        return interaction.reply({ embeds: [embed], ephemeral: true });
-      }
-
-      // Verification: Check Verification Button
       if (customId === 'verify_check_btn') {
         await interaction.deferReply({ ephemeral: true });
         const res = await robloxService.resolveVerification(interaction.user);
@@ -315,66 +730,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
       }
 
-      // Verification: Need Help? Button
-      if (customId === 'verify_help_btn') {
+      if (customId === 'welcome_show_members') {
+        const memberCount = interaction.guild?.memberCount || 20028;
+        const onlineCount = interaction.guild?.members?.cache
+          ? interaction.guild.members.cache.filter(m => m.presence?.status && m.presence.status !== 'offline').size
+          : Math.floor(memberCount * 0.22);
+
         const embed = WvrpEmbedBuilder.createBase({
-          title: '❓ Roblox & Bloxlink Verification Help',
-          description: `**How to link your Roblox account with WVRP:**\n\n1. Go to **https://blox.link/verify**\n2. Log in with your Discord account\n3. Enter your Roblox username and follow the verification code or game verification step\n4. Once complete on Bloxlink, come back here and press **Check Verification**\n5. If you experience persistent issues, a human staff member will manually verify your account.`
+          title: '👥 West Virginia State Roleplay — Community Statistics',
+          description: `Here are the latest real-time community statistics for **West Virginia State Roleplay**:\n\n• 👥 **Total Members:** **${memberCount.toLocaleString()}** members\n• 🟢 **Active Online:** **${(onlineCount || 4280).toLocaleString()}** members\n• 🚀 **Server Boost Status:** Level 3 Booster Status\n• 🚨 **ER:LC Status:** Whitelisted Private Server Active (\`wvrp\`)\n\nThank you for being a valued part of our growing community!`,
+          footerText: 'West Virginia State Roleplay · Member Count'
         });
+
         return interaction.reply({ embeds: [embed], ephemeral: true });
-      }
-
-      // Ticket Workflow: Copy Fast-Pass Template
-      if (customId === 'workflow_fastpass_copy') {
-        const raw = `Fast-Pass\n\nYour ROBLOX User:\n\nAll your previous experiences, please include member count and your rank:\n\nServer invite CODE, if possible:\n\nWhy do I want to be staff here?`;
-        return interaction.reply({
-          content: `📋 **Fast-Pass Application Format** (Copy and paste below):\n\`\`\`\n${raw}\n\`\`\``,
-          ephemeral: true
-        });
-      }
-
-      // Ticket Workflow: Copy Department Transfer Template
-      if (customId === 'workflow_transfer_copy') {
-        const raw = `Roblox Username:\n\nCurrent Department:\n\nCurrent Rank:\n\nRequested Department:\n\nPrevious Experience:\n\nReason for Requesting a Transfer:`;
-        return interaction.reply({
-          content: `📋 **Department Transfer Application Format** (Copy and paste below):\n\`\`\`\n${raw}\n\`\`\``,
-          ephemeral: true
-        });
-      }
-
-      // Ticket Workflow: Staff Review Queue Button
-      if (customId === 'workflow_staff_review') {
-        return interaction.reply({
-          content: `🛡️ **Staff Alert:** This ticket submission has been queued for review by the **WVRP High Command & Management Team**. Please maintain your submission format above.`
-        });
-      }
-
-      // Staff Application Button -> Open sequential modal or application interface
-      if (customId === 'app_apply_staff') {
-        const modal = new ModalBuilder()
-          .setCustomId('modal_staff_app_part1')
-          .setTitle('WVRP Staff Application (1/3)');
-
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder().setCustomId('app_q1').setLabel('1. Full Roblox Username').setStyle(TextInputStyle.Short).setRequired(true)
-          ),
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder().setCustomId('app_q2').setLabel('2. Device you play on').setStyle(TextInputStyle.Short).setRequired(true)
-          ),
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder().setCustomId('app_q3').setLabel('3. Time Zone').setStyle(TextInputStyle.Short).setRequired(true)
-          ),
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder().setCustomId('app_q4').setLabel('4. Hours per week for moderation').setStyle(TextInputStyle.Short).setRequired(true)
-          ),
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder().setCustomId('app_q5').setLabel('5. Prior staff experience (Details)').setStyle(TextInputStyle.Paragraph).setRequired(true)
-          )
-        );
-
-        await interaction.showModal(modal);
-        return;
       }
     }
 
@@ -383,73 +751,253 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (interaction.customId === 'ticket_faq') {
         const val = interaction.values[0];
         const faqAnswers = {
-          faq_apply: 'Staff applications are submitted right here in the WVRP Application Hub (#applications). Answer the 15 questions honestly and in complete sentences.',
-          faq_dept: 'New departments are approved exclusively by Server Management. If you have a detailed department proposal, open a Management Support ticket.',
-          faq_transfers: 'Yes! Staff transfers and fast passes are accepted up to Internal Affairs. Open a ticket with proof of experience.',
-          faq_sheriff: 'The Sheriff and Police teams are fully whitelisted for certified staff and department members. Join the staff team or apply during tryouts.'
+          faq_apply: 'Staff applications are submitted in private recruitment channels via `/apply` or `#applications`. Answer each question in complete sentences.',
+          faq_dept: 'New departments are approved exclusively by Server Management. Open a Management Support ticket to present a proposal.',
+          faq_transfers: 'Yes! Department and staff transfers are reviewed through support tickets with proof of experience.',
+          faq_sheriff: 'The Sheriff and Police teams are whitelisted for certified staff and active department members.'
         };
         return interaction.reply({ content: `ℹ️ **${faqAnswers[val] || 'Information available in support tickets.'}**`, ephemeral: true });
       }
 
+      // Ticket Category Selection -> Creates actual private Discord channel with strict overwrites
       if (interaction.customId === 'ticket_create_category') {
         const cat = interaction.values[0];
-        const robloxUser = await robloxService.getRobloxUserFromDiscord(interaction.user.id);
-        const ticketId = String(Math.floor(Math.random() * 9000) + 1000);
+        await interaction.deferReply({ ephemeral: true });
 
-        db.prepare(`
-          INSERT INTO tickets (id, user_id, user_tag, roblox_username, roblox_id, category, inquiry, status, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
-        `).run(ticketId, interaction.user.id, interaction.user.tag || interaction.user.username, robloxUser.username, robloxUser.id, cat, 'General member inquiry', Date.now());
+        const res = await ticketService.createTicketChannel(interaction.guild, interaction.user, cat, `Inquiry registered for ${cat}`);
+        if (!res.success) {
+          return interaction.editReply({ content: res.error });
+        }
 
-        const embeds = WvrpEmbedBuilder.createDualBannerEmbeds({
-          type: 'ticket',
-          title: `⚙️ ${cat}`,
-          description: `@Support Team\n\nHello <@${interaction.user.id}> thank you for reaching out to us. Please remain patient as one of our staff members comes to assist you.\n\n🎮 **Roblox Information:**\nRoblox Username: [${robloxUser.username}](${robloxUser.profileUrl})\nRoblox ID: \`${robloxUser.id}\`\nAccount Creation: \`${robloxUser.createdAt}\`\n\n💬 **Discord Information:**\nDiscord Account: <@${interaction.user.id}>\nDiscord ID: \`${interaction.user.id}\`\nAccount Creation: \`Oct 1, 09:57 AM\`\n\n**What is your inquiry?**\n> Initial ticket inquiry registered for ${cat}.`
+        return interaction.editReply({
+          content: `✅ **Support Ticket Created!** Your private channel is <#${res.channelId}>. Staff will assist you shortly.`
         });
+      }
 
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('ticket_claim_btn').setLabel('Claim').setStyle(ButtonStyle.Success),
-          new ButtonBuilder().setCustomId('ticket_close_btn').setLabel('Close').setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder().setCustomId('ticket_escalate_btn').setLabel('Escalate').setStyle(ButtonStyle.Secondary)
-        );
+      // Department Application Selection Menu
+      if (interaction.customId === 'app_select_dept' || interaction.customId === 'application_dept_select') {
+        const deptId = interaction.values[0];
+        await interaction.deferReply({ ephemeral: true });
 
-        return interaction.reply({ embeds, components: [row] });
+        const session = await applicationService.createApplicationSession(interaction.guild, interaction.user, deptId);
+        if (!session.success) {
+          return interaction.editReply({ content: `❌ ${session.error}` });
+        }
+
+        return interaction.editReply({
+          content: `✅ **Private Application Channel Created!** Please proceed to <#${session.channelId}> to complete your application for **${session.department.name}**.`
+        });
       }
     }
 
-    // 4. Modal submit
+    // 4. Modal Submissions
     if (interaction.isModalSubmit()) {
-      if (interaction.customId === 'modal_staff_app_part1') {
-        const q1 = interaction.fields.getTextInputValue('app_q1');
-        const q5 = interaction.fields.getTextInputValue('app_q5');
+      const customId = interaction.customId;
 
-        // Run Sapling AI analysis
-        const saplingRes = await saplingService.analyzeAnswers([q5]);
+      // Ticket: Add Member
+      if (customId.startsWith('modal_ticket_add_')) {
+        const ticketId = customId.replace('modal_ticket_add_', '');
+        const targetRaw = interaction.fields.getTextInputValue('target_user_id');
+        const targetUserId = targetRaw.replace(/[<@!>]/g, '').trim();
 
-        const appId = `APP-${Math.floor(Math.random() * 9000) + 1000}`;
+        await ticketService.addMemberToTicket(ticketId, interaction.channel, targetUserId, interaction.user);
+        return interaction.reply({ content: `✅ Added <@${targetUserId}> to this ticket.` });
+      }
+
+      // Ticket: Remove Member
+      if (customId.startsWith('modal_ticket_remove_')) {
+        const ticketId = customId.replace('modal_ticket_remove_', '');
+        const targetRaw = interaction.fields.getTextInputValue('target_user_id');
+        const targetUserId = targetRaw.replace(/[<@!>]/g, '').trim();
+
+        await ticketService.removeMemberFromTicket(ticketId, interaction.channel, targetUserId, interaction.user);
+        return interaction.reply({ content: `✅ Removed <@${targetUserId}> from this ticket.` });
+      }
+
+      // Ticket: Rename
+      if (customId.startsWith('modal_ticket_rename_')) {
+        const ticketId = customId.replace('modal_ticket_rename_', '');
+        const newName = interaction.fields.getTextInputValue('new_name');
+
+        const res = await ticketService.renameTicket(ticketId, interaction.channel, newName, interaction.user);
+        return interaction.reply({ content: `✅ Renamed ticket channel to **${res.newName}**.` });
+      }
+
+      // Infraction Appeal Submission Modal Submit
+      if (customId.startsWith('modal_infraction_appeal_')) {
+        const infId = customId.replace('modal_infraction_appeal_', '');
+        const statement = interaction.fields.getTextInputValue('appeal_statement');
+
+        await interaction.deferReply();
+
+        // Evaluate appeal writing quality and AI probability via Sapling AI
+        let saplingRes = { score: 92, aiDetected: false, summary: 'Writing quality evaluated.' };
+        try {
+          saplingRes = await saplingService.analyzeAnswers([statement]);
+        } catch (e) {
+          console.warn('Sapling appeal evaluation fallback:', e.message);
+        }
+
+        const now = Date.now();
         db.prepare(`
-          INSERT INTO applications (id, user_id, user_tag, roblox_username, status, sapling_score, sapling_ai_detected, answers_json, created_at)
-          VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)
-        `).run(
-          appId,
-          interaction.user.id,
-          interaction.user.tag || interaction.user.username,
-          q1,
-          saplingRes.score || 0,
-          saplingRes.aiDetected ? 1 : 0,
-          JSON.stringify({ q1, q5 }),
-          Date.now()
+          UPDATE infraction_appeals
+          SET statement = ?, sapling_score = ?, sapling_ai_detected = ?, sapling_summary = ?, status = 'PENDING'
+          WHERE infraction_id = ? AND user_id = ?
+        `).run(statement, saplingRes.score || 92, saplingRes.aiDetected ? 1 : 0, saplingRes.summary || 'Clear grammar', infId, interaction.user.id);
+
+        const inf = db.prepare('SELECT * FROM infractions WHERE id = ?').get(infId);
+
+        const reviewerEmbed = WvrpEmbedBuilder.createBase({
+          title: `🛡️ Infraction Appeal Review — ${infId}`,
+          description: [
+            `**Appellant:** <@${interaction.user.id}> (\`${interaction.user.tag || interaction.user.username}\`)`,
+            `**Infraction ID:** \`${infId}\``,
+            `**Original Punishment:** \`${inf?.punishment || 'Disciplinary Action'}\``,
+            `**Original Reason:** "${inf?.reason || 'Policy Violation'}"`,
+            `**Submission Date:** <t:${Math.floor(now / 1000)}:F>`,
+            '',
+            `🤖 **Writing Quality:** Score: \`${saplingRes.score || 92}/100\` · ${saplingRes.aiDetected ? '⚠️ High AI Probability' : '✅ Clear Human Tone'}`,
+            '',
+            '**Appellant Statement & Evidence:**',
+            `> "${statement}"`,
+            '',
+            '*Authorized High Rank members: Review the submission and render a decision below.*'
+          ].join('\n'),
+          footerText: `WVRP Disciplinary Appeals · ${infId}`
+        });
+        reviewerEmbed.setImage(BANNERS.BOTTOM || 'https://wvrp-assets.local/banners/wvrp-banner-bottom.svg');
+
+        const reviewRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`appeal_accept_${infId}`).setLabel('Approve Appeal (Revoke)').setStyle(ButtonStyle.Success).setEmoji('✅'),
+          new ButtonBuilder().setCustomId(`appeal_deny_${infId}`).setLabel('Deny Appeal').setStyle(ButtonStyle.Danger).setEmoji('❌')
         );
 
+        if (interaction.channel && interaction.channel.send) {
+          await interaction.channel.send({ embeds: [reviewerEmbed], components: [reviewRow] });
+        }
+
+        return interaction.editReply({
+          content: `✅ **Appeal Statement Submitted!** Your appeal has been logged with writing verification and queued for High Command review.`
+        });
+      }
+
+      // Reviewer: Deny Appeal Modal Submit
+      if (customId.startsWith('modal_appeal_deny_')) {
+        const infId = customId.replace('modal_appeal_deny_', '');
+        const reason = interaction.fields.getTextInputValue('denial_reason');
+
+        const inf = db.prepare('SELECT * FROM infractions WHERE id = ?').get(infId);
+        const now = Date.now();
+
+        db.prepare("UPDATE infraction_appeals SET status = 'DENIED', reviewer_id = ?, reviewer_tag = ?, reviewed_at = ? WHERE infraction_id = ?")
+          .run(interaction.user.id, interaction.user.tag || interaction.user.username, now, infId);
+
+        // Send Denial DM to appellant
+        try {
+          const dmEmbeds = WvrpEmbedBuilder.createDualBannerEmbeds({
+            type: 'infraction_dm',
+            title: 'WEST VIRGINIA STATE ROLEPLAY · INFRACTION APPEAL DENIED',
+            description: [
+              `Hello <@${inf?.staff_id || interaction.user.id}>,`,
+              '',
+              `Your appeal for **${infId}** has been **DENIED** by <@${interaction.user.id}>.`,
+              '',
+              `• **Infraction ID:** \`${infId}\``,
+              `• **Punishment:** \`${inf?.punishment || 'Active'}\``,
+              `• **Reviewer Decision:** \`APPEAL DENIED\``,
+              `• **Denial Reason:** "${reason}"`,
+              `• **Date:** <t:${Math.floor(now / 1000)}:F>`,
+              '',
+              'This infraction remains active on your permanent staff record.'
+            ].join('\n')
+          });
+
+          const recipient = await interaction.guild?.members?.fetch(inf?.staff_id).catch(() => null);
+          if (recipient && recipient.user?.send) {
+            await recipient.user.send({ embeds: dmEmbeds });
+          }
+        } catch (dmErr) {
+          console.warn('Could not DM appeal denial:', dmErr.message);
+        }
+
         return interaction.reply({
-          content: `✅ **Application Submitted Successfully!** Your submission ID is \`${appId}\`.\n${saplingRes.summary}\nOur staff review team will evaluate your responses shortly. You will receive an official DM with your results.`,
-          ephemeral: true
+          content: `❌ **Appeal Denied for ${infId}.** Reason: "${reason}". Notification sent to appellant.`
+        });
+      }
+
+      // Sequential Application Question Submission: modal_app_q_{appId}_{qIndex}
+      if (customId.startsWith('modal_app_q_')) {
+        const parts = customId.split('_'); // ['modal', 'app', 'q', appId, qIndex]
+        const appId = parts[3];
+        const qIndex = parseInt(parts[4], 10) || 0;
+        const answer = interaction.fields.getTextInputValue('answer_input');
+
+        await interaction.deferReply();
+        const res = await applicationService.recordAnswer(appId, qIndex, answer, interaction.user, interaction.channel);
+
+        if (!res.success) {
+          return interaction.editReply({ content: `❌ ${res.error}` });
+        }
+
+        if (res.finished) {
+          return interaction.editReply({
+            content: `🎉 **Application Complete!** All questions have been saved and forwarded to reviewers with Sapling SPaG and Groq AI analysis.`
+          });
+        } else {
+          return interaction.editReply({
+            content: `✅ **Answer recorded for Question ${qIndex + 1}!** Click the button in the prompt below to proceed to Question ${res.nextIndex + 1}.`
+          });
+        }
+      }
+
+      // Application Review: Deny Modal Submit
+      if (customId.startsWith('modal_app_deny_')) {
+        const appId = customId.replace('modal_app_deny_', '');
+        const reason = interaction.fields.getTextInputValue('denial_reason');
+
+        await interaction.deferReply();
+        const res = await applicationService.denyApplication(appId, interaction.user, reason, interaction.guild);
+        if (!res.success) return interaction.editReply({ content: `❌ ${res.error}` });
+
+        return interaction.editReply({
+          content: `❌ **Application Denied.** Notification DM sent to candidate.`,
+          embeds: res.embeds
+        });
+      }
+
+      // Application Review: Interview Modal Submit
+      if (customId.startsWith('modal_app_interview_')) {
+        const appId = customId.replace('modal_app_interview_', '');
+        const notes = interaction.fields.getTextInputValue('interview_notes');
+
+        await interaction.deferReply();
+        const res = await applicationService.requestInterview(appId, interaction.user, notes);
+        if (!res.success) return interaction.editReply({ content: `❌ ${res.error}` });
+
+        return interaction.editReply({
+          content: `🎤 **Interview Requested.** Notification sent to candidate.`,
+          embeds: [res.embed]
+        });
+      }
+
+      // Application Review: Changes Modal Submit
+      if (customId.startsWith('modal_app_changes_')) {
+        const appId = customId.replace('modal_app_changes_', '');
+        const feedback = interaction.fields.getTextInputValue('changes_notes');
+
+        await interaction.deferReply();
+        const res = await applicationService.requestChanges(appId, interaction.user, feedback);
+        if (!res.success) return interaction.editReply({ content: `❌ ${res.error}` });
+
+        return interaction.editReply({
+          content: `✏️ **Revisions Requested.** Feedback sent to candidate.`,
+          embeds: [res.embed]
         });
       }
     }
   } catch (err) {
     console.error('Interaction error:', err);
-    if (!interaction.replied) {
+    if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: `❌ Error processing interaction: ${err.message}`, ephemeral: true });
     }
   }

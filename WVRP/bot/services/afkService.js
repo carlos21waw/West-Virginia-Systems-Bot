@@ -13,7 +13,7 @@ export class AfkService {
   getConfig() {
     return {
       enabled: this.isEnabled(),
-      prefix: process.env.AFK_NICKNAME_PREFIX !== undefined ? process.env.AFK_NICKNAME_PREFIX : 'AFK | ',
+      prefix: process.env.AFK_NICKNAME_PREFIX !== undefined ? process.env.AFK_NICKNAME_PREFIX : '[AFK] ',
       suffix: process.env.AFK_NICKNAME_SUFFIX || '',
       notifyPingers: process.env.AFK_NOTIFY_PINGERS !== 'false',
       logChannelId: process.env.AFK_LOG_CHANNEL_ID || null
@@ -44,21 +44,30 @@ export class AfkService {
     return db.prepare('SELECT * FROM afk_status WHERE user_id = ? AND is_afk = 1').get(userId);
   }
 
-  computeAfkNickname(originalNickname) {
+  /**
+   * Strip any existing AFK prefix or suffix from a nickname to get the true original
+   */
+  cleanOriginalNickname(nickname) {
+    if (!nickname || typeof nickname !== 'string') return 'Member';
+    const cleaned = nickname
+      .replace(/^(\[AFK\]\s*|AFK\s*\|\s*|\(AFK\)\s*)+/gi, '')
+      .replace(/(\s*\[AFK\]|\s*\|?\s*AFK|\s*\(AFK\))+$/gi, '')
+      .trim();
+    return cleaned || 'Member';
+  }
+
+  /**
+   * Safely compute AFK nickname within Discord's 32 character limit
+   */
+  computeAfkNickname(rawNickname) {
     const config = this.getConfig();
-    const prefix = config.prefix;
-    const suffix = config.suffix;
-    let targetNickname = originalNickname || 'Member';
+    const prefix = config.prefix || '[AFK] ';
+    const suffix = config.suffix || '';
+    const clean = this.cleanOriginalNickname(rawNickname);
 
-    if (!targetNickname.startsWith(prefix.trim())) {
-      targetNickname = `${prefix}${originalNickname}${suffix}`;
-    }
-
-    if (targetNickname.length > 32) {
-      const allowedOriginal = 32 - prefix.length - suffix.length;
-      targetNickname = `${prefix}${originalNickname.slice(0, Math.max(1, allowedOriginal))}${suffix}`;
-    }
-    return targetNickname;
+    const maxBaseLen = 32 - prefix.length - suffix.length;
+    const truncated = clean.slice(0, Math.max(1, maxBaseLen));
+    return `${prefix}${truncated}${suffix}`;
   }
 
   logPing(afkUserId, pingerId, pingerTag, messageContent, channelId = 'chat', channelName = 'general') {
@@ -85,36 +94,44 @@ export class AfkService {
 
   /**
    * Activate AFK for a member.
-   * Handles nickname renaming, database persistence, and embed creation.
+   * Handles nickname renaming, database persistence, role hierarchy checks, and embed creation.
    */
   async setAfk(member, user, reason = 'AFK', guild = null) {
-    const config = this.getConfig();
     const userId = user?.id || (typeof member === 'string' ? member : member?.id);
-    const guildId = guild?.id || member?.guild?.id || 'wvrp_guild';
+    const resolvedGuild = guild || member?.guild;
     const userTag = user?.tag || user?.username || member?.userTag || member?.username || 'Member';
     const now = Date.now();
 
-    // 1. Determine original nickname
-    const originalNickname = member?.nickname || member?.displayName || user?.displayName || user?.username || member?.originalNickname || 'Member';
+    // 1. Determine clean original nickname (stripping any existing AFK flags)
+    const rawNick = member?.nickname || member?.displayName || user?.displayName || user?.username || 'Member';
+    const hadCustomNickname = member?.nickname ? 1 : 0;
+    const cleanOriginal = this.cleanOriginalNickname(rawNick);
 
-    // 2. Prepare new AFK nickname (avoiding double prefix and truncating safely at 32 chars)
-    const targetNickname = this.computeAfkNickname(originalNickname);
+    // 2. Compute new AFK nickname
+    const targetNickname = this.computeAfkNickname(cleanOriginal);
 
-    // 3. Attempt Discord member nickname edit
+    // 3. Attempt Discord member nickname edit with role hierarchy verification
     let nicknameChanged = false;
     let nicknameError = null;
 
     if (member && typeof member.setNickname === 'function') {
-      try {
-        await member.setNickname(targetNickname, `AFK: ${reason}`);
-        nicknameChanged = true;
-      } catch (err) {
-        nicknameError = err.message;
-        console.warn(`Could not set nickname for ${userTag} (${userId}):`, err.message);
+      const isOwner = resolvedGuild && resolvedGuild.ownerId === userId;
+      const isManageable = member.manageable !== false && !isOwner;
+
+      if (isManageable) {
+        try {
+          await member.setNickname(targetNickname, `AFK: ${reason}`);
+          nicknameChanged = true;
+        } catch (err) {
+          nicknameError = err.message;
+          console.warn(`Could not set nickname for ${userTag} (${userId}):`, err.message);
+        }
+      } else {
+        nicknameError = 'Higher role hierarchy / Guild Owner';
       }
     }
 
-    // 4. Save to SQLite database
+    // 4. Save to SQLite database (persists across bot restarts)
     db.prepare(`
       INSERT INTO afk_status (user_id, guild_id, user_tag, reason, original_nickname, nickname_changed, is_afk, timestamp, mentions_json)
       VALUES (?, ?, ?, ?, ?, ?, 1, ?, '[]')
@@ -129,10 +146,10 @@ export class AfkService {
         mentions_json = '[]'
     `).run(
       userId,
-      guildId,
+      resolvedGuild?.id || 'wvrp_guild',
       userTag,
       reason || 'AFK',
-      originalNickname,
+      cleanOriginal,
       nicknameChanged ? 1 : 0,
       now
     );
@@ -143,18 +160,18 @@ export class AfkService {
     // 5. Build announcement embed
     const embed = new EmbedBuilder()
       .setColor(0x00a8ff)
-      .setTitle(`🕒 AFK | ${originalNickname} is now AFK`)
+      .setTitle(`🕒 AFK | ${cleanOriginal} is now AFK`)
       .setDescription(
         `📌 **Reason:** ${reason || 'AFK'}\n\n` +
-        `Anyone who pings you will be told. Send a message when you're back and I'll show who pinged you.` +
-        (nicknameError ? `\n\n*(Note: Nickname could not be updated due to Discord hierarchy permissions)*` : '')
+        `Anyone who pings you will be informed. Send a message when you return to view any missed pings.` +
+        (nicknameError ? `\n\n*(Note: Nickname could not be updated: ${nicknameError})*` : '')
       )
-      .setFooter({ text: 'West Virginia Roleplay · AFK Management System' })
+      .setFooter({ text: 'West Virginia Systems · AFK Management' })
       .setTimestamp(new Date());
 
     return {
       success: true,
-      originalNickname,
+      originalNickname: cleanOriginal,
       newNickname: targetNickname,
       nicknameChanged,
       nicknameError,
@@ -228,6 +245,7 @@ export class AfkService {
 
   /**
    * Check if a message sender is currently AFK and process their return.
+   * Restores clean original nickname or clears custom nickname.
    */
   async handleReturn(message) {
     if (!this.isEnabled()) return null;
@@ -248,13 +266,23 @@ export class AfkService {
     let nicknameRestored = false;
     let restoreError = null;
 
-    if (message.member && typeof message.member.setNickname === 'function' && afkRecord.original_nickname) {
-      try {
-        await message.member.setNickname(afkRecord.original_nickname, 'Returned from AFK');
-        nicknameRestored = true;
-      } catch (err) {
-        restoreError = err.message;
-        console.warn(`Could not restore nickname for ${userId}:`, err.message);
+    if (message.member && typeof message.member.setNickname === 'function') {
+      const isOwner = message.guild && message.guild.ownerId === userId;
+      const isManageable = message.member.manageable !== false && !isOwner;
+
+      if (isManageable) {
+        try {
+          const cleanOriginal = this.cleanOriginalNickname(afkRecord.original_nickname);
+          // If original matches username, pass null to clear nickname back to default
+          const targetRestore = cleanOriginal === message.author.username ? null : cleanOriginal;
+          await message.member.setNickname(targetRestore, 'Returned from AFK');
+          nicknameRestored = true;
+        } catch (err) {
+          restoreError = err.message;
+          console.warn(`Could not restore nickname for ${userId}:`, err.message);
+        }
+      } else {
+        restoreError = 'Higher role hierarchy / Guild Owner';
       }
     }
 
@@ -283,13 +311,14 @@ export class AfkService {
       }
     }
 
+    const cleanName = this.cleanOriginalNickname(afkRecord.original_nickname || message.author.username);
     const embed = new EmbedBuilder()
       .setColor(0x23a55a)
-      .setTitle(`👋 Welcome back, ${afkRecord.original_nickname || message.author.username}!`)
+      .setTitle(`👋 Welcome back, ${cleanName}!`)
       .setDescription(
         `You were AFK for **${durationText}**.\n\n${pingsDescription}`
       )
-      .setFooter({ text: 'West Virginia Roleplay · AFK Management System' })
+      .setFooter({ text: 'West Virginia Systems · AFK Management' })
       .setTimestamp(new Date());
 
     if (message.channel?.send) {
@@ -305,7 +334,7 @@ export class AfkService {
 
     return {
       userId,
-      originalNickname: afkRecord.original_nickname,
+      originalNickname: cleanName,
       durationMs,
       durationText,
       pingsCount: pings.length,

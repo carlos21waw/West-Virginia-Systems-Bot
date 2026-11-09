@@ -277,6 +277,23 @@ db.exec(`
     created_at INTEGER
   );
 
+  CREATE TABLE IF NOT EXISTS infraction_appeals (
+    id TEXT PRIMARY KEY,
+    infraction_id TEXT,
+    user_id TEXT,
+    user_tag TEXT,
+    channel_id TEXT,
+    statement TEXT,
+    sapling_score REAL DEFAULT 0,
+    sapling_ai_detected INTEGER DEFAULT 0,
+    sapling_summary TEXT,
+    status TEXT DEFAULT 'PENDING',
+    reviewer_id TEXT,
+    reviewer_tag TEXT,
+    created_at INTEGER,
+    reviewed_at INTEGER
+  );
+
   CREATE TABLE IF NOT EXISTS afk_status (
     user_id TEXT PRIMARY KEY,
     guild_id TEXT,
@@ -423,6 +440,53 @@ db.exec(`
     trigger_phrase TEXT,
     created_at INTEGER
   );
+  CREATE TABLE IF NOT EXISTS departments (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    description TEXT,
+    role_id TEXT,
+    reviewer_role_id TEXT,
+    leader_id TEXT,
+    leader_tag TEXT,
+    co_leader_id TEXT,
+    category_channel_id TEXT,
+    results_channel_id TEXT,
+    questions_json TEXT,
+    active INTEGER DEFAULT 1,
+    created_at INTEGER
+  );
+
+  CREATE TABLE IF NOT EXISTS department_members (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    department_id TEXT,
+    user_id TEXT,
+    user_tag TEXT,
+    rank TEXT,
+    callsign TEXT,
+    status TEXT DEFAULT 'ACTIVE',
+    joined_at INTEGER
+  );
+
+  CREATE TABLE IF NOT EXISTS chain_of_command (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    department_id TEXT,
+    rank_name TEXT,
+    rank_order INTEGER,
+    user_id TEXT,
+    user_tag TEXT,
+    position_title TEXT,
+    is_leadership INTEGER DEFAULT 0,
+    updated_at INTEGER
+  );
+
+  CREATE TABLE IF NOT EXISTS application_answers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    application_id TEXT,
+    question_index INTEGER,
+    question_prompt TEXT,
+    answer_text TEXT,
+    updated_at INTEGER
+  );
 `);
 
 // Safe column migrations for existing SQLite database instances
@@ -433,6 +497,26 @@ try {
   if (!afkCols.includes('user_tag')) db.exec("ALTER TABLE afk_status ADD COLUMN user_tag TEXT");
   if (!afkCols.includes('nickname_changed')) db.exec("ALTER TABLE afk_status ADD COLUMN nickname_changed INTEGER DEFAULT 0");
   if (!afkCols.includes('is_afk')) db.exec("ALTER TABLE afk_status ADD COLUMN is_afk INTEGER DEFAULT 1");
+
+  const appCols = db.prepare("PRAGMA table_info(applications)").all().map(c => c.name);
+  if (!appCols.includes('department_id')) db.exec("ALTER TABLE applications ADD COLUMN department_id TEXT DEFAULT 'staff'");
+  if (!appCols.includes('department_name')) db.exec("ALTER TABLE applications ADD COLUMN department_name TEXT DEFAULT 'Staff Applications'");
+  if (!appCols.includes('channel_id')) db.exec("ALTER TABLE applications ADD COLUMN channel_id TEXT");
+  if (!appCols.includes('current_question_index')) db.exec("ALTER TABLE applications ADD COLUMN current_question_index INTEGER DEFAULT 0");
+  if (!appCols.includes('groq_summary')) db.exec("ALTER TABLE applications ADD COLUMN groq_summary TEXT");
+  if (!appCols.includes('interview_notes')) db.exec("ALTER TABLE applications ADD COLUMN interview_notes TEXT");
+  if (!appCols.includes('denial_reason')) db.exec("ALTER TABLE applications ADD COLUMN denial_reason TEXT");
+  if (!appCols.includes('change_request_notes')) db.exec("ALTER TABLE applications ADD COLUMN change_request_notes TEXT");
+  const appealCols = db.prepare("PRAGMA table_info(infraction_appeals)").all().map(c => c.name);
+  if (!appealCols.includes('user_id')) db.exec("ALTER TABLE infraction_appeals ADD COLUMN user_id TEXT");
+  if (!appealCols.includes('user_tag')) db.exec("ALTER TABLE infraction_appeals ADD COLUMN user_tag TEXT");
+  if (!appealCols.includes('channel_id')) db.exec("ALTER TABLE infraction_appeals ADD COLUMN channel_id TEXT");
+  if (!appealCols.includes('statement')) db.exec("ALTER TABLE infraction_appeals ADD COLUMN statement TEXT");
+  if (!appealCols.includes('sapling_score')) db.exec("ALTER TABLE infraction_appeals ADD COLUMN sapling_score REAL DEFAULT 0");
+  if (!appealCols.includes('sapling_ai_detected')) db.exec("ALTER TABLE infraction_appeals ADD COLUMN sapling_ai_detected INTEGER DEFAULT 0");
+  if (!appealCols.includes('sapling_summary')) db.exec("ALTER TABLE infraction_appeals ADD COLUMN sapling_summary TEXT");
+  if (!appealCols.includes('reviewer_tag')) db.exec("ALTER TABLE infraction_appeals ADD COLUMN reviewer_tag TEXT");
+  if (!appealCols.includes('reviewed_at')) db.exec("ALTER TABLE infraction_appeals ADD COLUMN reviewed_at INTEGER");
 } catch (e) {
   // Ignore migration errors if already existing
 }
@@ -486,14 +570,152 @@ if (countMarketplace === 0) {
     insertListing.run(item.id, item.cat, item.title, item.desc, item.price, item.perks);
   }
 }
+// Seed default departments if empty
+const countDepartments = db.prepare('SELECT COUNT(*) as count FROM departments').get().count;
+if (countDepartments === 0) {
+  const defaultDepts = [
+    {
+      id: 'wvsp',
+      name: 'West Virginia State Police (WVSP)',
+      description: 'Primary state law enforcement division responsible for highway patrol, investigations, and high-risk tactical responses.',
+      role_id: 'role_wvsp',
+      reviewer_role_id: 'role_wvsp_leadership',
+      leader_id: '2056966914',
+      leader_tag: 'Colonel Carlos',
+      questions: JSON.stringify([
+        'What is your Roblox username and age?',
+        'Why do you want to join the West Virginia State Police?',
+        'What prior law enforcement or ER:LC police experience do you have?',
+        'How would you handle a 10-80 (vehicle pursuit) entering high-traffic city streets?',
+        'Explain the protocol for using lethal force versus non-lethal taser deployment.'
+      ])
+    },
+    {
+      id: 'fire_ems',
+      name: 'Kanawha Valley Fire & EMS',
+      description: 'First responders providing rapid fire suppression, medical triage, hazardous material control, and rescue operations.',
+      role_id: 'role_fire',
+      reviewer_role_id: 'role_fire_leadership',
+      leader_id: '1025813762684502168',
+      leader_tag: 'Fire Chief Dave',
+      questions: JSON.stringify([
+        'What is your full Roblox username?',
+        'Why are you interested in serving with Kanawha Valley Fire & EMS?',
+        'Describe your familiarity with medical roleplay and fire apparatus operation in ER:LC.',
+        'A multi-vehicle collision has occurred with entrapment and active fire. Detail your initial response steps.',
+        'How do you handle high-stress emergency scenes with chaotic civilian presence?'
+      ])
+    },
+    {
+      id: 'comms',
+      name: 'Kanawha Emergency Communications',
+      description: 'Central dispatch center coordinating radio frequencies, 911 calls, officer status checks, and multi-agency response.',
+      role_id: 'role_comms',
+      reviewer_role_id: 'role_comms_leadership',
+      leader_id: '987654321',
+      leader_tag: 'Dispatch Director Sarah',
+      questions: JSON.stringify([
+        'What is your Roblox username and time zone?',
+        'Why do you want to become a certified Emergency Communications Operator?',
+        'Rate your typing speed, multi-tasking skills, and radio code knowledge (1-10).',
+        'An officer calls a 10-00 (Officer Down / Emergency Distress). Walk through your immediate radio broadcast.',
+        'Do you understand you must maintain accurate in-game CAD/MDT logs during active sessions?'
+      ])
+    },
+    {
+      id: 'dot',
+      name: 'WV Division of Highways & Transportation (WVDOT)',
+      description: 'Highway maintenance, incident management, road closures, heavy towing, and infrastructure safety.',
+      role_id: 'role_dot',
+      reviewer_role_id: 'role_dot_leadership',
+      leader_id: '1122334455',
+      leader_tag: 'Supervisor Miller',
+      questions: JSON.stringify([
+        'What is your Roblox username?',
+        'Why do you want to join WVDOT rather than standard law enforcement?',
+        'How do you properly secure a major highway accident scene to protect civilian drivers?',
+        'Explain how you would handle an impatient driver attempting to bypass a road closure barrier.'
+      ])
+    },
+    {
+      id: 'media',
+      name: 'WVRP Media Team',
+      description: 'Creative department capturing cinematic roleplay footage, photography, community trailers, and social outreach.',
+      role_id: 'role_media',
+      reviewer_role_id: 'role_media_leadership',
+      leader_id: '2056966914',
+      leader_tag: 'Media Lead Alex',
+      questions: JSON.stringify([
+        'What is your Roblox username and Discord tag?',
+        'What video editing software or graphics tools do you use?',
+        'Provide links to 1-3 examples of your previous roleplay edits, photography, or designs.',
+        'How would you capture high-intensity emergency scenes without interfering with active roleplay?'
+      ])
+    },
+    {
+      id: 'staff',
+      name: 'WVRP Staff Team (Trainee Moderator)',
+      description: 'Community regulation, server moderation, support ticket resolution, and rule enforcement.',
+      role_id: 'role_staff_trainee',
+      reviewer_role_id: 'role_high_rank',
+      leader_id: '2056966914',
+      leader_tag: 'Head of Staff Carlos',
+      questions: JSON.stringify([
+        'What is your full Roblox username?',
+        'What device do you play on?',
+        'What is your time zone?',
+        'How many hours can you moderate per week?',
+        'Do you have any prior staff or moderation experience? If so, where?',
+        'Why do you want to join the WVRP staff team?',
+        'What is RDM, and how would you handle it if someone broke this rule?',
+        'What is VDM, and how would you handle it if someone broke this rule?',
+        'What is LTAP, and how would you handle it if someone broke this rule?',
+        'What is FRP, and how would you handle it if someone broke this rule?',
+        'What is NLR, and how would you handle it if someone broke this rule?',
+        'What is the punishment if someone rejoins right after being kicked?',
+        'A player is spamming the in-game chat with inappropriate language after multiple warnings. Walk through exactly what you would do, step by step.',
+        'Do you understand that you must remain professional at all times, both in-game and in Discord? Also confirm you understand asking staff to read your application results in denial.',
+        'Is there anything else you would like the application team to know? (If not, put N/A)'
+      ])
+    }
+  ];
 
-// Seed default session if empty
-const countSession = db.prepare('SELECT COUNT(*) as count FROM sessions').get().count;
-if (countSession === 0) {
-  db.prepare(`
-    INSERT INTO sessions (id, status, server_name, join_code, owner_name, player_count, queue_count, staff_count, updated_at)
-    VALUES ('main', 'ONLINE', 'West Virginia Roleplay | Strict | Realistic', 'wvrp', 'WVRP Management', 18, 2, 4, ?)
-  `).run(Date.now());
+  const insertDept = db.prepare(`
+    INSERT INTO departments (id, name, description, role_id, reviewer_role_id, leader_id, leader_tag, questions_json, active, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+  `);
+
+  for (const dept of defaultDepts) {
+    insertDept.run(dept.id, dept.name, dept.description, dept.role_id, dept.reviewer_role_id, dept.leader_id, dept.leader_tag, dept.questions, Date.now());
+  }
+}
+
+// Seed default Chain of Command hierarchy if empty
+const countCoC = db.prepare('SELECT COUNT(*) as count FROM chain_of_command').get().count;
+if (countCoC === 0) {
+  const defaultCoC = [
+    { dept: 'general', rank: 'Community Owner / Founder', order: 1, id: '2056966914', tag: 'CarlosValdivia', title: 'Community Executive', lead: 1 },
+    { dept: 'general', rank: 'Directive Team / Board', order: 2, id: '987654321', tag: 'TaranBatman', title: 'Community Directive', lead: 1 },
+    { dept: 'general', rank: 'Head of Staff / Management', order: 3, id: '1025813762684502168', tag: 'Puppylover130915', title: 'Senior High Rank', lead: 1 },
+    { dept: 'general', rank: 'Senior Administrator', order: 4, id: '314159265', tag: 'DeputySmith', title: 'High Rank Operations', lead: 0 },
+    { dept: 'general', rank: 'Server Moderator', order: 5, id: '1122334455', tag: 'OfficerDave', title: 'Staff Moderator', lead: 0 },
+    { dept: 'general', rank: 'Trial Trainee', order: 6, id: '9988776655', tag: 'CadetJohn', title: 'Staff Trainee', lead: 0 },
+    { dept: 'wvsp', rank: 'Colonel / Superintendent', order: 1, id: '2056966914', tag: 'Colonel Carlos', title: 'State Police Commander', lead: 1 },
+    { dept: 'wvsp', rank: 'Lieutenant Colonel', order: 2, id: '987654321', tag: 'Lt. Colonel Wayne', title: 'Executive Officer', lead: 1 },
+    { dept: 'wvsp', rank: 'Captain', order: 3, id: '314159265', tag: 'Capt. Smith', title: 'Troop Commander', lead: 0 },
+    { dept: 'fire_ems', rank: 'Fire Chief', order: 1, id: '1025813762684502168', tag: 'Chief Dave', title: 'Department Head', lead: 1 },
+    { dept: 'fire_ems', rank: 'Assistant Chief', order: 2, id: '1122334455', tag: 'Asst. Chief Miller', title: 'EMS Operations', lead: 1 }
+  ];
+
+  const insertCoC = db.prepare(`
+    INSERT INTO chain_of_command (department_id, rank_name, rank_order, user_id, user_tag, position_title, is_leadership, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  for (const item of defaultCoC) {
+    insertCoC.run(item.dept, item.rank, item.order, item.id, item.tag, item.title, item.lead, Date.now());
+  }
 }
 
 export default db;
+

@@ -15,6 +15,9 @@ import afkService from './WVRP/bot/services/afkService.js';
 import welcomeService from './WVRP/bot/services/welcomeService.js';
 import boostService from './WVRP/bot/services/boostService.js';
 import ticketWorkflowService, { WORKFLOW_TYPES, WORKFLOW_DEFINITIONS } from './WVRP/bot/services/ticketWorkflowService.js';
+import departmentService from './WVRP/bot/services/departmentService.js';
+import applicationService from './WVRP/bot/services/applicationService.js';
+import ticketService from './WVRP/bot/services/ticketService.js';
 import { commands, prefixCommands, formatUnknownCommandMessage } from './WVRP/bot/handlers/commandRegistry.js';
 import { WvrpEmbedBuilder, BANNERS, BANNER_MAPPINGS, resolveBanners, DEFAULT_LOCAL_BANNERS } from './WVRP/bot/embeds/wvrpEmbeds.js';
 import { client } from './WVRP/index.js';
@@ -250,71 +253,77 @@ app.get('/api/erlc/data', async (req, res) => {
   });
 });
 
-// API: Support Tickets
-app.get('/api/tickets', (req, res) => {
-  const rows = db.prepare('SELECT * FROM tickets ORDER BY created_at DESC LIMIT 50').all();
-  res.json(rows);
+// API: Infraction Appeals
+app.get('/api/appeals', (req, res) => {
+  try {
+    const rows = db.prepare(`
+      SELECT a.*, i.staff_tag, i.reason as infraction_reason, i.punishment as infraction_punishment
+      FROM infraction_appeals a
+      LEFT JOIN infractions i ON a.infraction_id = i.id
+      ORDER BY a.created_at DESC LIMIT 50
+    `).all();
+    res.json(rows);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post('/api/tickets/create', async (req, res) => {
-  const { category = 'General Support', inquiry = 'General question', user = { id: '2056966914', username: 'carlos473' } } = req.body;
-  const robloxUser = await robloxService.getRobloxUserFromDiscord(user.id);
-  const ticketId = String(Math.floor(Math.random() * 9000) + 1000);
+app.post('/api/appeals/submit', async (req, res) => {
+  try {
+    const { infractionId, statement, user = { id: '2056966914', username: 'CarlosWVRP' } } = req.body;
+    if (!infractionId || !statement) {
+      return res.status(400).json({ error: 'infractionId and statement are required' });
+    }
+    const saplingRes = await saplingService.analyzeAnswers([statement]).catch(() => ({ score: 90, aiDetected: false, summary: 'Writing analyzed.' }));
+    const appealId = `APL-${Date.now().toString().slice(-4)}`;
+    const now = Date.now();
 
-  db.prepare(`
-    INSERT INTO tickets (id, user_id, user_tag, roblox_username, roblox_id, category, inquiry, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
-  `).run(ticketId, user.id, user.username, robloxUser.username, robloxUser.id, category, inquiry, Date.now());
+    db.prepare(`
+      INSERT INTO infraction_appeals (id, infraction_id, user_id, user_tag, statement, sapling_score, sapling_ai_detected, sapling_summary, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
+    `).run(
+      appealId,
+      infractionId,
+      user.id,
+      user.username,
+      statement,
+      saplingRes.score || 90,
+      saplingRes.aiDetected ? 1 : 0,
+      saplingRes.summary || 'Grammar clear',
+      now
+    );
 
-  res.json({ success: true, ticketId, robloxUser });
+    res.json({ success: true, appealId, sapling: saplingRes });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// API: AI Ticket Assistant
-app.post('/api/tickets/ai-reply', async (req, res) => {
-  const { ticketId, userMessage } = req.body;
-  const history = db.prepare('SELECT * FROM ticket_messages WHERE ticket_id = ? ORDER BY timestamp ASC').all(ticketId);
-  const replyRes = await groqService.generateTicketResponse(ticketId, userMessage, history);
-  res.json(replyRes);
+app.post('/api/appeals/review', (req, res) => {
+  try {
+    const { appealId, decision, reviewer = { id: 'admin', username: 'HighCommand' }, reason = '' } = req.body;
+    const appeal = db.prepare('SELECT * FROM infraction_appeals WHERE id = ?').get(appealId) as any;
+    if (!appeal) return res.status(404).json({ error: 'Appeal not found' });
+
+    const now = Date.now();
+    if (decision === 'accept' || decision === 'APPROVED') {
+      db.transaction(() => {
+        db.prepare("UPDATE infractions SET status = 'REVOKED', revoked_by = ?, revoke_reason = ? WHERE id = ?")
+          .run(reviewer.username, `Appeal accepted: ${reason || 'Approved by High Command'}`, appeal.infraction_id);
+        db.prepare("UPDATE infraction_appeals SET status = 'ACCEPTED', reviewer_id = ?, reviewer_tag = ?, reviewed_at = ? WHERE id = ?")
+          .run(reviewer.id, reviewer.username, now, appealId);
+      })();
+      return res.json({ success: true, decision: 'ACCEPTED', appealId });
+    } else {
+      db.prepare("UPDATE infraction_appeals SET status = 'DENIED', reviewer_id = ?, reviewer_tag = ?, reviewed_at = ? WHERE id = ?")
+        .run(reviewer.id, reviewer.username, now, appealId);
+      return res.json({ success: true, decision: 'DENIED', appealId, reason });
+    }
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// API: Applications
-app.get('/api/applications', (req, res) => {
-  const rows = db.prepare('SELECT * FROM applications ORDER BY created_at DESC').all();
-  res.json(rows);
-});
-
-app.post('/api/applications/submit', async (req, res) => {
-  const { answers = [], user = { id: '2056966914', username: 'Carlos473' } } = req.body;
-  const saplingRes = await saplingService.analyzeAnswers(answers);
-  const appId = `APP-${Math.floor(Math.random() * 9000) + 1000}`;
-
-  db.prepare(`
-    INSERT INTO applications (id, user_id, user_tag, roblox_username, status, sapling_score, sapling_ai_detected, answers_json, created_at)
-    VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)
-  `).run(
-    appId,
-    user.id,
-    user.username,
-    answers[0] || user.username,
-    saplingRes.score || 0,
-    saplingRes.aiDetected ? 1 : 0,
-    JSON.stringify(answers),
-    Date.now()
-  );
-
-  res.json({ success: true, appId, sapling: saplingRes });
-});
-
-app.post('/api/applications/review', (req, res) => {
-  const { appId, decision, reviewer = 'StaffReviewer' } = req.body;
-  db.prepare(`
-    UPDATE applications
-    SET status = ?, reviewer_tag = ?, reviewed_at = ?
-    WHERE id = ?
-  `).run(decision, reviewer, Date.now(), appId);
-
-  res.json({ success: true, decision, appId });
-});
 
 // API: Marketplace
 app.get('/api/marketplace/listings', (req, res) => {
@@ -636,6 +645,170 @@ app.post('/api/workflows/simulate', async (req, res) => {
 app.post('/api/workflows/manual-trigger', async (req, res) => {
   const { workflowType, ticketId = '0850', staffMember = { id: 'staff', username: 'WebStaff' } } = req.body;
   const result = await ticketWorkflowService.triggerManualWorkflow(ticketId, null, workflowType, staffMember);
+  res.json(result);
+});
+
+// ==========================================
+// API: Department Management & Rosters
+// ==========================================
+app.get('/api/departments', (req, res) => {
+  const depts = (departmentService.getAllDepartments() || []) as any[];
+  const enhanced = depts.map((d: any) => {
+    const roster = departmentService.getRoster(d.id);
+    let questions = [];
+    try { questions = JSON.parse(d.questions_json || '[]'); } catch { questions = []; }
+    return {
+      ...d,
+      questions,
+      rosterCount: roster.length,
+      roster
+    };
+  });
+  res.json(enhanced);
+});
+
+app.get('/api/departments/:id', (req, res) => {
+  const dept = departmentService.getDepartment(req.params.id) as any;
+  if (!dept) return res.status(404).json({ error: 'Department not found' });
+  const roster = departmentService.getRoster(dept.id);
+  let questions = [];
+  try { questions = JSON.parse(dept.questions_json || '[]'); } catch { questions = []; }
+  res.json({ ...dept, questions, roster });
+});
+
+app.post('/api/departments', (req, res) => {
+  const result = departmentService.createDepartment(req.body);
+  if (!result.success) return res.status(400).json(result);
+  res.json(result);
+});
+
+app.put('/api/departments/:id', (req, res) => {
+  const result = departmentService.editDepartment(req.params.id, req.body);
+  if (!result.success) return res.status(400).json(result);
+  res.json(result);
+});
+
+app.delete('/api/departments/:id', (req, res) => {
+  const result = departmentService.deleteDepartment(req.params.id);
+  if (!result.success) return res.status(400).json(result);
+  res.json(result);
+});
+
+app.post('/api/departments/:id/roster', (req, res) => {
+  const { userId, userTag = 'Member', rank = 'Member', callsign = '' } = req.body;
+  if (!userId) return res.status(400).json({ error: 'User ID is required' });
+  const result = departmentService.addMemberToRoster(req.params.id, { id: userId, tag: userTag }, rank, callsign);
+  res.json(result);
+});
+
+app.delete('/api/departments/:id/roster/:memberId', (req, res) => {
+  const result = departmentService.removeMemberFromRoster(req.params.id, req.params.memberId);
+  res.json(result);
+});
+
+// ==========================================
+// API: Chain of Command Hierarchy
+// ==========================================
+app.get('/api/coc/:deptId?', (req, res) => {
+  const deptId = req.params.deptId || 'staff';
+  const hierarchy = departmentService.getChainOfCommand(deptId);
+  res.json({ departmentId: deptId, hierarchy });
+});
+
+app.post('/api/coc', (req, res) => {
+  const { departmentId = 'staff', rankOrder, rankTitle, holderUserId = '0', holderName = 'Officer', notes = '' } = req.body;
+  if (!rankOrder || !rankTitle) {
+    return res.status(400).json({ error: 'rankOrder and rankTitle are required' });
+  }
+  const result = departmentService.setChainOfCommandRank({
+    departmentId,
+    rankName: rankTitle,
+    rankOrder: parseInt(rankOrder, 10) || 1,
+    userId: holderUserId,
+    userTag: holderName,
+    positionTitle: notes || rankTitle,
+    isLeadership: 1
+  });
+  res.json(result);
+});
+
+// ==========================================
+// API: Applications Management
+// ==========================================
+app.get('/api/applications', (req, res) => {
+  const apps = db.prepare('SELECT * FROM applications ORDER BY created_at DESC LIMIT 50').all();
+  res.json(apps);
+});
+
+app.get('/api/applications/:id', (req, res) => {
+  const appData = applicationService.getApplication(req.params.id) as any;
+  if (!appData) return res.status(404).json({ error: 'Application not found' });
+  const answers = applicationService.getAnswers(appData.id);
+  res.json({ ...appData, answers });
+});
+
+app.post('/api/applications/create', async (req, res) => {
+  const { userId = '2056966914', username = 'CarlosWVRP', departmentId = 'staff' } = req.body;
+  const userMock = { id: userId, username, tag: `${username}#0001` };
+  const session = await applicationService.createApplicationSession(null, userMock, departmentId);
+  res.json(session);
+});
+
+app.post('/api/applications/answer', async (req, res) => {
+  const { appId, questionIndex, answerText, userId = '2056966914', username = 'CarlosWVRP' } = req.body;
+  if (!appId || questionIndex === undefined || !answerText) {
+    return res.status(400).json({ error: 'appId, questionIndex, and answerText are required' });
+  }
+  const userMock = { id: userId, username, tag: `${username}#0001` };
+  const result = await applicationService.recordAnswer(appId, parseInt(questionIndex, 10), answerText, userMock);
+  res.json(result);
+});
+
+app.post('/api/applications/review', async (req, res) => {
+  const { appId, action, reviewer = { id: 'admin', username: 'SuperAdmin' }, reason = '', notes = '' } = req.body;
+  if (!appId || !action) return res.status(400).json({ error: 'appId and action are required' });
+
+  if (action === 'accept') {
+    const result = await applicationService.acceptApplication(appId, reviewer);
+    return res.json(result);
+  } else if (action === 'deny') {
+    const result = await applicationService.denyApplication(appId, reviewer, reason || 'Did not meet requirements.');
+    return res.json(result);
+  } else if (action === 'interview') {
+    const result = await applicationService.requestInterview(appId, reviewer, notes || 'Interview scheduled');
+    return res.json(result);
+  } else if (action === 'changes') {
+    const result = await applicationService.requestChanges(appId, reviewer, notes || 'Please revise your scenario answers');
+    return res.json(result);
+  } else {
+    return res.status(400).json({ error: `Unknown action: ${action}` });
+  }
+});
+
+// ==========================================
+// API: Support Tickets Management
+// ==========================================
+app.get('/api/tickets', (req, res) => {
+  const tickets = db.prepare('SELECT * FROM tickets ORDER BY created_at DESC LIMIT 50').all();
+  res.json(tickets);
+});
+
+app.post('/api/tickets/create', async (req, res) => {
+  const { userId = '2056966914', username = 'CarlosWVRP', category = 'General Support', inquiry = 'Inquiry from web portal' } = req.body;
+  const userMock = { id: userId, username, tag: `${username}#0001` };
+  const result = await ticketService.createTicketChannel(null, userMock, category, inquiry);
+  res.json(result);
+});
+
+app.post('/api/tickets/:id/claim', (req, res) => {
+  const { staffUser = { id: 'staff', username: 'StaffOfficer' } } = req.body;
+  const result = ticketService.claimTicket(req.params.id, staffUser);
+  res.json(result);
+});
+
+app.post('/api/tickets/:id/close', async (req, res) => {
+  const { closerUser = { id: 'staff', username: 'StaffOfficer' } } = req.body;
+  const result = await ticketService.closeTicket(req.params.id, closerUser);
   res.json(result);
 });
 
