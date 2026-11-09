@@ -1,0 +1,658 @@
+import express from 'express';
+import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import fs from 'fs';
+import db from './WVRP/bot/database/index.js';
+import erlcService from './WVRP/bot/services/erlcService.js';
+import groqService from './WVRP/bot/services/groqService.js';
+import saplingService from './WVRP/bot/services/saplingService.js';
+import cookieTranscriptService from './WVRP/bot/services/cookieTranscriptService.js';
+import shiftService from './WVRP/bot/services/shiftService.js';
+import robloxService from './WVRP/bot/services/robloxService.js';
+import antiPingService from './WVRP/bot/services/antiPingService.js';
+import afkService from './WVRP/bot/services/afkService.js';
+import welcomeService from './WVRP/bot/services/welcomeService.js';
+import boostService from './WVRP/bot/services/boostService.js';
+import ticketWorkflowService, { WORKFLOW_TYPES, WORKFLOW_DEFINITIONS } from './WVRP/bot/services/ticketWorkflowService.js';
+import { commands, prefixCommands, formatUnknownCommandMessage } from './WVRP/bot/handlers/commandRegistry.js';
+import { WvrpEmbedBuilder, BANNERS, BANNER_MAPPINGS, resolveBanners, DEFAULT_LOCAL_BANNERS } from './WVRP/bot/embeds/wvrpEmbeds.js';
+import { client } from './WVRP/index.js';
+
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = 3000;
+
+app.use(express.json());
+app.use(express.static(path.resolve('public')));
+app.use('/transcripts', express.static(path.resolve('transcripts')));
+
+// API: System & Bot Health Status
+app.get('/api/status', (req, res) => {
+  const getCount = (tbl: string) => {
+    try {
+      const row = db.prepare(`SELECT COUNT(*) as count FROM ${tbl}`).get() as any;
+      return row ? row.count : 0;
+    } catch {
+      return 0;
+    }
+  };
+
+  const tableCounts = {
+    tickets: getCount('tickets'),
+    infractions: getCount('infractions'),
+    promotions: getCount('promotions'),
+    shifts: getCount('staff_shifts'),
+    activeShifts: getCount('staff_active_status'),
+    applications: getCount('applications'),
+    marketplaceListings: getCount('marketplace_listings'),
+    economyUsers: getCount('economy'),
+    antiPingStrikes: getCount('anti_ping_strikes'),
+    antiPingLogs: getCount('anti_ping_logs'),
+    afkUsers: getCount('afk_status WHERE is_afk = 1'),
+    welcomeRecords: getCount('welcome_records'),
+    boostRecords: getCount('boost_records'),
+    tagRecords: getCount('server_tag_records'),
+    verifications: getCount('verifications'),
+    ticketWorkflows: getCount('ticket_automation_workflows'),
+    autoResponses: getCount('ticket_auto_responses')
+  };
+
+  res.json({
+    botName: 'West Virginia Roleplay (WVRP)',
+    prefix: process.env.DEFAULT_PREFIX || '-',
+    discordConnected: Boolean(client?.isReady?.()),
+    erlcConfigured: erlcService.isConfigured(),
+    groqConfigured: groqService.isConfigured(),
+    saplingConfigured: saplingService.isConfigured(),
+    bloxlinkConfigured: robloxService.isBloxlinkConfigured(),
+    cookieTranscriptConfigured: cookieTranscriptService.isConfigured(),
+    databaseStats: tableCounts,
+    commandsLoaded: commands.size,
+    prefixTriggersLoaded: prefixCommands.size
+  });
+});
+
+// API: WVRP Banner Configuration & Resolution System
+app.get('/api/banners', (req, res) => {
+  const envBanners: Record<string, string | undefined> = {};
+  for (const key of Object.keys(process.env)) {
+    if (key.includes('BANNER') || key === 'EMBED_COLOR') {
+      envBanners[key] = process.env[key];
+    }
+  }
+
+  const types = Object.keys(BANNER_MAPPINGS);
+  const resolvedList = types.map((type) => {
+    const mapping = (BANNER_MAPPINGS as any)[type];
+    const resolved = resolveBanners(type);
+    return {
+      type,
+      noTopBanner: Boolean(mapping.noTopBanner),
+      specificTopEnv: mapping.specificTopEnv || null,
+      systemTopEnv: mapping.systemTopEnv || null,
+      specificBottomEnv: mapping.specificBottomEnv || null,
+      systemBottomEnv: mapping.systemBottomEnv || null,
+      resolvedTop: resolved.topBanner,
+      resolvedBottom: resolved.bottomBanner,
+      defaultTop: mapping.defaultTop || DEFAULT_LOCAL_BANNERS.TOP,
+      defaultBottom: mapping.defaultBottom || DEFAULT_LOCAL_BANNERS.BOTTOM
+    };
+  });
+
+  res.json({
+    totalConfiguredTypes: types.length,
+    envBanners,
+    resolvedList,
+    globalFallbacks: {
+      TOP_BANNER_URL: process.env.TOP_BANNER_URL || null,
+      BOTTOM_BANNER_URL: process.env.BOTTOM_BANNER_URL || null,
+      EMBED_COLOR: process.env.EMBED_COLOR || '#00A8FF'
+    }
+  });
+});
+
+// API: Test Banner Resolution with Priority Breakdown
+app.post('/api/banners/test', (req, res) => {
+  const { type = 'community', overrideTop = null, overrideBottom = null } = req.body;
+  const mapping = (BANNER_MAPPINGS as any)[type] || (BANNER_MAPPINGS as any).community;
+  const resolved = resolveBanners(type, overrideTop, overrideBottom);
+
+  let topSource = 'local_default';
+  if (mapping.noTopBanner) {
+    topSource = 'disabled_by_rule (noTopBanner: true)';
+  } else if (overrideTop && overrideTop.trim().length > 0) {
+    topSource = 'custom_override';
+  } else if (mapping.specificTopEnv && process.env[mapping.specificTopEnv]) {
+    topSource = `specific_env (${mapping.specificTopEnv})`;
+  } else if (mapping.systemTopEnv && process.env[mapping.systemTopEnv]) {
+    topSource = `system_env (${mapping.systemTopEnv})`;
+  } else if (process.env.TOP_BANNER_URL) {
+    topSource = 'global_fallback (TOP_BANNER_URL)';
+  }
+
+  let bottomSource = 'local_default';
+  if (overrideBottom && overrideBottom.trim().length > 0) {
+    bottomSource = 'custom_override';
+  } else if (mapping.specificBottomEnv && process.env[mapping.specificBottomEnv]) {
+    bottomSource = `specific_env (${mapping.specificBottomEnv})`;
+  } else if (mapping.systemBottomEnv && process.env[mapping.systemBottomEnv]) {
+    bottomSource = `system_env (${mapping.systemBottomEnv})`;
+  } else if (process.env.BOTTOM_BANNER_URL) {
+    bottomSource = 'global_fallback (BOTTOM_BANNER_URL)';
+  }
+
+  res.json({
+    type,
+    resolvedTop: resolved.topBanner,
+    resolvedBottom: resolved.bottomBanner,
+    topSource,
+    bottomSource,
+    noTopBanner: Boolean(mapping.noTopBanner)
+  });
+});
+
+// API: Execute prefix or slash command
+app.post('/api/command/execute', async (req, res) => {
+  const { command, args = [], user = { id: '2056966914', username: 'carlos473', tag: 'Carlos473#0001' } } = req.body;
+  
+  const fullParts = (command || '').replace(/^[-/]/, '').trim().split(/ +/);
+  const cleanCmd = (fullParts[0] || '').toLowerCase();
+  const effectiveArgs = args && args.length > 0 ? args : fullParts.slice(1);
+  const cmdObj = prefixCommands.get(cleanCmd) || commands.get(cleanCmd);
+
+  if (!cmdObj) {
+    const unknownText = formatUnknownCommandMessage(cleanCmd);
+    return res.status(200).json({
+      success: true,
+      command: cleanCmd,
+      output: { content: unknownText }
+    });
+  }
+
+  let capturedReply = null;
+  const mockContext = {
+    user,
+    author: user,
+    channel: { id: 'channel_101', name: 'general-support-0850' },
+    guild: { id: 'guild_wvrp', name: 'West Virginia Roleplay' },
+    options: {
+      getSubcommand: () => effectiveArgs[0] || '',
+      getString: (key: string) => effectiveArgs[1] || '',
+      getUser: () => (effectiveArgs[1] ? { id: effectiveArgs[1].replace(/[<@!>]/g, ''), username: 'TargetMember', tag: 'TargetMember#0001' } : null),
+      getBoolean: () => true
+    },
+    reply: (payload: any) => {
+      capturedReply = payload;
+      return Promise.resolve(payload);
+    }
+  };
+
+  try {
+    await cmdObj.execute(mockContext, effectiveArgs);
+    res.json({
+      success: true,
+      command: cleanCmd,
+      output: capturedReply
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// API: Shift Management
+app.get('/api/shifts/active', (req, res) => {
+  res.json(shiftService.getActiveShifts());
+});
+
+app.get('/api/shifts/leaderboard', (req, res) => {
+  const page = parseInt(req.query.page as string || '1');
+  res.json(shiftService.getLeaderboard(page, 10));
+});
+
+app.post('/api/shifts/action', (req, res) => {
+  const { action, staffMember = { id: '2056966914', username: 'carlos473' }, shiftType = 'NORMAL' } = req.body;
+  if (action === 'start') {
+    return res.json(shiftService.startShift(staffMember, shiftType));
+  } else if (action === 'break') {
+    return res.json(shiftService.startBreak(staffMember));
+  } else if (action === 'resume') {
+    return res.json(shiftService.endBreak(staffMember));
+  } else if (action === 'end') {
+    return res.json(shiftService.endShift(staffMember));
+  }
+  res.status(400).json({ error: 'Unknown shift action' });
+});
+
+// API: ER:LC In-Game Chat Shift Command (;shift start, ;shift 50/50, ;shift break, ;shift end)
+app.post('/api/erlc/ingame-shift', (req, res) => {
+  const { robloxId = '2056966914', username = 'carlos473', command } = req.body;
+  const result = shiftService.handleInGameChatCommand(robloxId, username, command);
+  res.json(result);
+});
+
+// API: ER:LC Live Data
+app.get('/api/erlc/data', async (req, res) => {
+  const server = await erlcService.getServerInfo();
+  const players = await erlcService.getPlayers();
+  const staff = await erlcService.getStaff();
+  const killLogs = await erlcService.getKillLogs();
+  res.json({
+    configured: erlcService.isConfigured(),
+    server: server.data,
+    players: players.data?.Players || [],
+    staff: staff.data?.Staff || null,
+    killLogs: killLogs.data?.KillLogs || []
+  });
+});
+
+// API: Support Tickets
+app.get('/api/tickets', (req, res) => {
+  const rows = db.prepare('SELECT * FROM tickets ORDER BY created_at DESC LIMIT 50').all();
+  res.json(rows);
+});
+
+app.post('/api/tickets/create', async (req, res) => {
+  const { category = 'General Support', inquiry = 'General question', user = { id: '2056966914', username: 'carlos473' } } = req.body;
+  const robloxUser = await robloxService.getRobloxUserFromDiscord(user.id);
+  const ticketId = String(Math.floor(Math.random() * 9000) + 1000);
+
+  db.prepare(`
+    INSERT INTO tickets (id, user_id, user_tag, roblox_username, roblox_id, category, inquiry, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
+  `).run(ticketId, user.id, user.username, robloxUser.username, robloxUser.id, category, inquiry, Date.now());
+
+  res.json({ success: true, ticketId, robloxUser });
+});
+
+// API: AI Ticket Assistant
+app.post('/api/tickets/ai-reply', async (req, res) => {
+  const { ticketId, userMessage } = req.body;
+  const history = db.prepare('SELECT * FROM ticket_messages WHERE ticket_id = ? ORDER BY timestamp ASC').all(ticketId);
+  const replyRes = await groqService.generateTicketResponse(ticketId, userMessage, history);
+  res.json(replyRes);
+});
+
+// API: Applications
+app.get('/api/applications', (req, res) => {
+  const rows = db.prepare('SELECT * FROM applications ORDER BY created_at DESC').all();
+  res.json(rows);
+});
+
+app.post('/api/applications/submit', async (req, res) => {
+  const { answers = [], user = { id: '2056966914', username: 'Carlos473' } } = req.body;
+  const saplingRes = await saplingService.analyzeAnswers(answers);
+  const appId = `APP-${Math.floor(Math.random() * 9000) + 1000}`;
+
+  db.prepare(`
+    INSERT INTO applications (id, user_id, user_tag, roblox_username, status, sapling_score, sapling_ai_detected, answers_json, created_at)
+    VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)
+  `).run(
+    appId,
+    user.id,
+    user.username,
+    answers[0] || user.username,
+    saplingRes.score || 0,
+    saplingRes.aiDetected ? 1 : 0,
+    JSON.stringify(answers),
+    Date.now()
+  );
+
+  res.json({ success: true, appId, sapling: saplingRes });
+});
+
+app.post('/api/applications/review', (req, res) => {
+  const { appId, decision, reviewer = 'StaffReviewer' } = req.body;
+  db.prepare(`
+    UPDATE applications
+    SET status = ?, reviewer_tag = ?, reviewed_at = ?
+    WHERE id = ?
+  `).run(decision, reviewer, Date.now(), appId);
+
+  res.json({ success: true, decision, appId });
+});
+
+// API: Marketplace
+app.get('/api/marketplace/listings', (req, res) => {
+  const listings = db.prepare('SELECT * FROM marketplace_listings WHERE active = 1').all();
+  res.json(listings);
+});
+
+app.post('/api/marketplace/order', (req, res) => {
+  const { listingId, itemTitle, details = '', user = { id: '2056966914', username: 'Carlos473' } } = req.body;
+  const orderId = `ORD-${Date.now().toString().slice(-6)}`;
+  db.prepare(`
+    INSERT INTO marketplace_orders (id, customer_id, customer_tag, listing_id, item_title, status, details, created_at)
+    VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?)
+  `).run(orderId, user.id, user.username, listingId, itemTitle, details, Date.now());
+
+  res.json({ success: true, orderId });
+});
+
+// ==========================================
+// API: Anti-Ping System Endpoints
+// ==========================================
+app.get('/api/antiping/config', (req, res) => {
+  res.json(antiPingService.getConfig());
+});
+
+app.get('/api/antiping/records', (req, res) => {
+  const strikes = db.prepare('SELECT * FROM anti_ping_strikes ORDER BY updated_at DESC LIMIT 50').all();
+  const logs = antiPingService.getRecentLogs(30);
+  res.json({ strikes, logs });
+});
+
+app.post('/api/antiping/action', (req, res) => {
+  const { action, userId, count, staffTag = 'WebStaff' } = req.body;
+  if (!userId) return res.status(400).json({ error: 'User ID is required' });
+
+  if (action === 'reset') {
+    const result = antiPingService.resetUserStrikes(userId, staffTag);
+    return res.json(result);
+  }
+  if (action === 'set') {
+    const result = antiPingService.setUserStrikes(userId, count || 0, staffTag);
+    return res.json(result);
+  }
+  res.status(400).json({ error: 'Invalid action. Supported: reset, set' });
+});
+
+app.post('/api/antiping/simulate', async (req, res) => {
+  const {
+    userId = '1122334455',
+    username = 'CuriousUser',
+    team = 'Foundership Team',
+    mockMessageContent = 'Hey @Foundership Team, when is session?'
+  } = req.body;
+
+  const mockMessage = {
+    id: `sim_msg_${Date.now()}`,
+    content: mockMessageContent,
+    author: { id: userId, username, tag: `${username}#0001`, bot: false },
+    member: {
+      id: userId,
+      roles: { cache: new Map() },
+      permissions: { has: () => false },
+      timeout: async (ms: number, reason: string) => {
+        return Promise.resolve();
+      }
+    },
+    guild: { id: 'wvrp_guild', channels: { cache: new Map() } },
+    channel: {
+      id: 'general_chat',
+      send: async (payload: any) => Promise.resolve(payload)
+    },
+    deletable: true,
+    delete: async () => Promise.resolve()
+  };
+
+  const detection = {
+    detected: true,
+    type: 'ROLE_MENTION',
+    teamName: team,
+    targetRoleId: 'role_foundership_999'
+  };
+
+  const result = await antiPingService.processViolation(mockMessage, detection);
+  res.json(result);
+});
+
+// ==========================================
+// API: AFK System Endpoints
+// ==========================================
+app.get('/api/afk/list', (req, res) => {
+  const activeAfk = afkService.getActiveAfkUsers();
+  const recentPings = db.prepare('SELECT * FROM afk_pings ORDER BY created_at DESC LIMIT 30').all();
+  res.json({ activeAfk, recentPings, config: afkService.getConfig() });
+});
+
+app.post('/api/afk/set', async (req, res) => {
+  const { userId = '2056966914', username = 'CarlosValdivia', reason = 'Taking a dinner break' } = req.body;
+  const mockMember = {
+    displayName: username,
+    nickname: username,
+    setNickname: async (newNick: string) => {
+      mockMember.nickname = newNick;
+      return Promise.resolve();
+    }
+  };
+  const mockUser = { id: userId, username, tag: `${username}#0001` };
+
+  const result = await afkService.setAfk(mockMember, mockUser, reason);
+  res.json(result);
+});
+
+app.post('/api/afk/simulate-ping', async (req, res) => {
+  const {
+    afkUserId = '2056966914',
+    pingerId = '9988776655',
+    pingerUsername = 'OfficerDave',
+    content = 'Hey @CarlosValdivia need backup on Main St'
+  } = req.body;
+
+  let capturedNotice: any = null;
+  const mockMessage = {
+    id: `msg_ping_${Date.now()}`,
+    content,
+    author: { id: pingerId, username: pingerUsername, tag: `${pingerUsername}#0001`, bot: false },
+    mentions: {
+      users: new Map([[afkUserId, { id: afkUserId, username: 'CarlosValdivia', displayName: 'CarlosValdivia' }]])
+    },
+    channel: {
+      id: 'patrol_chat',
+      name: 'patrol-comms',
+      send: async (payload: any) => {
+        capturedNotice = payload;
+        return Promise.resolve(payload);
+      }
+    }
+  };
+
+  const responses = await afkService.handleMentions(mockMessage);
+  res.json({ success: true, capturedNotice, responses });
+});
+
+app.post('/api/afk/simulate-return', async (req, res) => {
+  const { userId = '2056966914', username = 'CarlosValdivia' } = req.body;
+
+  let capturedWelcome: any = null;
+  const mockMember = {
+    displayName: `AFK | ${username}`,
+    nickname: `AFK | ${username}`,
+    setNickname: async (orig: string) => {
+      mockMember.nickname = orig;
+      return Promise.resolve();
+    }
+  };
+
+  const mockMessage = {
+    id: `msg_return_${Date.now()}`,
+    content: 'Back from dinner!',
+    author: { id: userId, username, tag: `${username}#0001`, bot: false },
+    member: mockMember,
+    channel: {
+      id: 'general_chat',
+      send: async (payload: any) => {
+        capturedWelcome = payload;
+        return Promise.resolve(payload);
+      }
+    }
+  };
+
+  const result = await afkService.handleReturn(mockMessage);
+  res.json({ success: true, result, capturedWelcome });
+});
+
+// ==========================================
+// API: Automatic Welcome System Endpoints
+// ==========================================
+app.get('/api/welcome/config', (req, res) => {
+  res.json(welcomeService.getConfig());
+});
+
+app.get('/api/welcome/records', (req, res) => {
+  res.json(welcomeService.getRecentWelcomes(40));
+});
+
+app.post('/api/welcome/simulate', async (req, res) => {
+  const {
+    userId = '2056966914',
+    username = 'CarlosWVRP',
+    memberCount = 20028
+  } = req.body;
+
+  const result = await welcomeService.simulateJoin({
+    userId,
+    username,
+    memberCount: parseInt(memberCount, 10) || 20028
+  });
+
+  res.json(result);
+});
+
+// ==========================================
+// API: Server Boost & Server Tag Endpoints
+// ==========================================
+app.get('/api/boost/config', (req, res) => {
+  res.json(boostService.getConfig());
+});
+
+app.get('/api/boost/records', (req, res) => {
+  res.json({
+    boosts: boostService.getRecentBoosts(30),
+    tags: boostService.getRecentTags(30)
+  });
+});
+
+app.post('/api/boost/simulate', async (req, res) => {
+  const {
+    userId = '2056966914',
+    username = 'CarlosWVRP',
+    boostLevel = 3,
+    boostCount = 14
+  } = req.body;
+
+  const result = await boostService.simulateBoost({
+    userId,
+    username,
+    boostLevel: parseInt(boostLevel, 10) || 3,
+    boostCount: parseInt(boostCount, 10) || 14
+  });
+
+  res.json(result);
+});
+
+app.post('/api/boost/simulate-tag', async (req, res) => {
+  const {
+    userId = '2056966914',
+    username = 'CarlosWVRP',
+    tag = 'WVRP'
+  } = req.body;
+
+  const result = await boostService.simulateTag({
+    userId,
+    username,
+    tag
+  });
+
+  res.json(result);
+});
+
+// ==========================================
+// API: Roblox & Bloxlink Verification Endpoints
+// ==========================================
+app.get('/api/verification/list', (req, res) => {
+  res.json(robloxService.getAllVerifications(50));
+});
+
+app.post('/api/verification/lookup', async (req, res) => {
+  const { query, type = 'discord_id' } = req.body;
+  if (!query) return res.status(400).json({ error: 'Search query is required' });
+
+  if (type === 'roblox_username') {
+    const robloxUser = await robloxService.getUserByName(query);
+    if (!robloxUser) return res.status(404).json({ error: `Roblox user "${query}" not found.` });
+    return res.json({ verified: true, robloxUser });
+  }
+
+  // Discord ID lookup
+  const mockUser = { id: query.replace(/[<@!>]/g, ''), username: 'MemberTarget' };
+  const result = await robloxService.resolveVerification(mockUser);
+  res.json(result);
+});
+
+app.post('/api/verification/manual-verify', async (req, res) => {
+  const { discordId, discordTag = 'Member', robloxUsernameOrId, staffMember = { id: 'staff', username: 'WebStaff' } } = req.body;
+  if (!discordId || !robloxUsernameOrId) {
+    return res.status(400).json({ error: 'Discord ID and Roblox Username/ID are required' });
+  }
+
+  const result = await robloxService.staffManualVerify(discordId, discordTag, robloxUsernameOrId, staffMember);
+  res.json(result);
+});
+
+// ==========================================
+// API: Ticket Automation & Workflows Endpoints
+// ==========================================
+app.get('/api/workflows/definitions', (req, res) => {
+  res.json(WORKFLOW_DEFINITIONS);
+});
+
+app.get('/api/workflows/history', (req, res) => {
+  res.json({
+    activeWorkflows: ticketWorkflowService.getActiveWorkflows(40),
+    recentResponses: ticketWorkflowService.getRecentAutoResponses(40)
+  });
+});
+
+app.post('/api/workflows/simulate', async (req, res) => {
+  const { messageContent = 'Can I get a fast pass for my experience?', ticketId = '0850', user = { id: '2056966914', username: 'carlos473' } } = req.body;
+  
+  // Test both keyword and Groq context matching
+  const keywordMatch = ticketWorkflowService.detectKeywordWorkflow(messageContent);
+  const groqMatch = await ticketWorkflowService.detectGroqWorkflow(messageContent);
+
+  const matched = groqMatch || keywordMatch;
+  let payload = null;
+
+  if (matched) {
+    payload = ticketWorkflowService.generateWorkflowPayload(matched.type, user, ticketId);
+  }
+
+  res.json({
+    messageContent,
+    matched: Boolean(matched),
+    detection: matched,
+    keywordMatch,
+    groqMatch,
+    payload
+  });
+});
+
+app.post('/api/workflows/manual-trigger', async (req, res) => {
+  const { workflowType, ticketId = '0850', staffMember = { id: 'staff', username: 'WebStaff' } } = req.body;
+  const result = await ticketWorkflowService.triggerManualWorkflow(ticketId, null, workflowType, staffMember);
+  res.json(result);
+});
+
+// Vite Middleware integration for dev mode
+async function startServer() {
+  if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa'
+    });
+    app.use(vite.middlewares);
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 WVRP Server and Discord Hub running at http://0.0.0.0:${PORT}`);
+  });
+}
+
+startServer();
